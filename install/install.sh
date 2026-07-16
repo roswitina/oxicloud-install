@@ -2,6 +2,9 @@
 #
 # install.sh
 #
+# Version: 1.2
+# Lizenz:  MIT
+#
 # Installiert ein entpacktes OxiCloud-Release-Paket auf dem System.
 # Ab Version 2: versionierte Releases unter releases/<version>/ mit einem
 # "current"-Symlink darauf (analog zum Vorbild-Script des Nutzers) - das
