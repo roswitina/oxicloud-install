@@ -42,7 +42,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-for f in "bin/oxicloud" "static" "example.env"; do
+for f in "bin/oxicloud" "static" "example.env" "update.sh"; do
   if [ ! -e "${PKG_DIR}/${f}" ]; then
     echo "Erwartete Datei/Ordner fehlt im Paket: ${f}" >&2
     exit 1
@@ -173,6 +173,15 @@ echo "==> systemd neu laden und Service aktivieren (aber nicht starten)"
 systemctl daemon-reload
 systemctl enable oxicloud.service
 
+# ─── 8. update.sh systemweit verfügbar machen ─────────────────────────────
+# Damit du künftig nicht das jeweils zuletzt entpackte Paketverzeichnis
+# wiederfinden musst: update.sh landet fest unter /usr/local/sbin und kann
+# von überall mit "sudo oxicloud-update /pfad/zum/neuen/paket" aufgerufen
+# werden. Es wird bei jeder install.sh-/erneuten Installation aktualisiert.
+UPDATE_WRAPPER="/usr/local/sbin/oxicloud-update"
+echo "==> Installiere Update-Wrapper: ${UPDATE_WRAPPER}"
+install -m 750 -o root -g "${APP_GROUP}" "${PKG_DIR}/update.sh" "${UPDATE_WRAPPER}"
+
 echo ""
 echo "Installation abgeschlossen."
 echo "Installiertes Release: ${VERSION}  (${RELEASE_DIR})"
@@ -186,3 +195,4 @@ echo "  4. Status prüfen:    systemctl status oxicloud"
 echo "  5. Logs ansehen:     journalctl -u oxicloud -f"
 echo ""
 echo "Verwaltung: systemctl [start|stop|restart|status] oxicloud"
+echo "Updates künftig mit:  sudo oxicloud-update /pfad/zum/neuen/paket"
