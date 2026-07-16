@@ -2,6 +2,9 @@
 #
 # update.sh
 #
+# Version: 1.0
+# Lizenz:  MIT
+#
 # Aktualisiert eine bereits per install.sh installierte OxiCloud-Instanz auf
 # ein neues Release, ohne Konfiguration (.env, systemd-Unit) anzufassen.
 #
