@@ -7,7 +7,7 @@ Zielserver einen Rust- oder Node-Compiler braucht.
 | Script | Version | Läuft wo? | Zweck |
 |---|---|---|---|
 | `build-package.sh` | 2.0 | Build-Maschine / CI | Baut Backend + Frontend, schnürt `.tar.gz` |
-| `install.sh` | 1.2 | Zielserver | Erstinstallation (User, Verzeichnisse, systemd) |
+| `install.sh` | 1.4 | Zielserver | Erstinstallation (User, Verzeichnisse, systemd, PostgreSQL-Check, Config-Backups) |
 | `update.sh` | 1.0 | Zielserver | Aktualisiert eine bestehende Installation, mit Rollback |
 
 Lizenz: MIT
@@ -39,7 +39,9 @@ Wer den Build-on-Target-Weg bevorzugt, braucht dieses Tooling nicht.
 **Zielserver** (wo `install.sh`/`update.sh` laufen):
 - Debian/Ubuntu mit systemd
 - root-Zugriff (bzw. `sudo`)
-- Eine erreichbare PostgreSQL-Instanz
+- Eine erreichbare PostgreSQL-Instanz — entweder bereits vorhanden (auch
+  remote/managed) oder von `install.sh` optional lokal mitinstalliert
+  (siehe Abschnitt „PostgreSQL" unten)
 - **Kein** Rust, **kein** Node.js nötig
 
 ---
@@ -95,6 +97,57 @@ Git-Pull-Script verwaltet wird.
    SHA256-Prüfsumme daneben
 
 **Ergebnis:** `<output-dir>/oxicloud-<version>-linux-<arch>.tar.gz`
+
+---
+
+## PostgreSQL: Erreichbarkeits-Check und optionale lokale Installation
+
+`install.sh` verhält sich hier zweistufig:
+
+**Immer (ohne Flag):** Nach dem Anlegen/Prüfen der `.env` wird die dort
+hinterlegte `OXICLOUD_DB_CONNECTION_STRING` ausgelesen und die
+Erreichbarkeit geprüft — erst ein reiner TCP-Check (`/dev/tcp`, keine
+Zusatzpakete nötig), zusätzlich ein echter Auth-Check per `psql`, falls
+dieses auf dem Zielserver vorhanden ist. Das Ergebnis ist immer nur eine
+**Warnung**, kein harter Abbruch — die Installation läuft in jedem Fall
+durch, du siehst am Ende nur, ob die DB schon erreichbar ist.
+
+**Optional (`--with-local-postgres`):** Installiert PostgreSQL zusätzlich
+lokal auf demselben Server, legt Rolle + Datenbank an und trägt die
+Connection-String automatisch in die `.env` ein — aber **nur**, wenn die
+`.env` bei diesem Lauf frisch erzeugt wird (eine bereits bestehende `.env`
+bleibt wie gehabt unangetastet, du bekommst dann nur die Zugangsdaten zum
+manuellen Eintragen angezeigt).
+
+```bash
+# Variante A: PostgreSQL läuft schon (remote/managed) - einfach normal installieren,
+# .env danach manuell mit der Connection-String befüllen
+sudo ./install.sh
+
+# Variante B: PostgreSQL soll gleich mit auf diesem Server eingerichtet werden
+sudo ./install.sh --with-local-postgres
+```
+
+Das erzeugte Passwort für die lokale Rolle wird unter
+`/etc/oxicloud/.db_password` gespeichert (`chmod 600`) und bei erneuten
+Läufen wiederverwendet (stabil über mehrere Installationen hinweg).
+
+**Randfall:** Enthält das Passwort in der Connection-String selbst ein
+`@`-Zeichen, kann der eingebaute Parser Host/Port nicht zuverlässig
+herauslösen — der Check wird dann sauber mit einer Warnung übersprungen,
+statt das Script abbrechen zu lassen.
+
+---
+
+## Was bei erneuten Läufen garantiert nicht überschrieben wird
+
+| Was | Schutzmechanismus |
+|---|---|
+| `.env`-Inhalt (Connection-String, Secrets, Base-URL) | Wird nur bei der allerersten Installation angelegt; jeder weitere Lauf lässt eine bestehende Datei komplett unangetastet |
+| Lokales DB-Passwort (`--with-local-postgres`) | Persistiert separat in `/etc/oxicloud/.db_password` (`chmod 600`); bei Vorhandensein wiederverwendet statt neu generiert |
+| Postgres-Rolle/Datenbank | Anlage erfolgt idempotent (`SELECT` vor jedem `CREATE`) — kein doppeltes Anlegen, keine Passwort-Überschreibung in Postgres selbst |
+| systemd-Unit | Vor jedem Überschreiben wird eine Zeitstempel-Kopie unter `/etc/systemd/system/backups/oxicloud.service.<timestamp>.bak` angelegt |
+| Bereits installiertes Release | `install.sh` bricht ab, wenn die Zielversion schon unter `releases/<version>/` existiert — für neue Versionen ist `update.sh` zuständig, das `.env`, DB-Passwort und Postgres gar nicht erst anfasst |
 
 ---
 
@@ -178,6 +231,7 @@ protokolliert.
 | `/etc/oxicloud/.env` | Konfiguration inkl. Secrets | `root:oxicloud` | `640` |
 | `/var/lib/oxicloud/storage` | Uploads/Nutzdaten | `oxicloud:oxicloud` | `750` |
 | `/etc/systemd/system/oxicloud.service` | systemd-Unit | `root:root` | `644` |
+| `/etc/systemd/system/backups/` | Zeitstempel-Backups der systemd-Unit vor jedem Überschreiben | `root:root` | — |
 | `/usr/local/sbin/oxicloud-update` | Update-Wrapper | `root:oxicloud` | `750` |
 | `/var/log/oxicloud-update.log` | Update-Protokoll | — | — |
 
@@ -222,7 +276,7 @@ journalctl -u oxicloud -f
 | Datei | Version | Wichtigste Änderung |
 |---|---|---|
 | `build-package.sh` | 2.0 | Quellcode-Pfad als Parameter statt festem Repo-Root-Aufruf |
-| `install.sh` | 1.2 | `oxicloud-update`-Wrapper nach `/usr/local/sbin` |
+| `install.sh` | 1.4 | Backup der systemd-Unit vor jedem Überschreiben (Zeitstempel-Kopie) |
 | `update.sh` | 1.0 | Erstversion mit Health-Check-Rollback |
 
 Lizenz: **MIT**
