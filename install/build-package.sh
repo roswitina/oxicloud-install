@@ -2,6 +2,9 @@
 #
 # build-package.sh
 #
+# Version: 1.1
+# Lizenz:  MIT
+#
 # Baut OxiCloud (Backend + Frontend) und schnürt daraus ein
 # selbst-enthaltenes tar.gz-Release-Paket:
 #   oxicloud-<version>-linux-<arch>.tar.gz
@@ -9,7 +12,9 @@
 #     ├── static/             # Vite-Build des Svelte-Frontends
 #     ├── migrations/         # nur falls NICHT in die Binary eingebettet
 #     ├── example.env         # Vorlage für die spätere .env
-#     └── install.sh          # Installer (siehe separate Datei)
+#     ├── install.sh          # Installer (siehe separate Datei)
+#     ├── update.sh           # Update-Script (siehe separate Datei)
+#     └── VERSION             # Versionsstring, von install.sh/update.sh gelesen
 #
 # Ausführen im Repo-Root von OxiCloud: ./build-package.sh [version]
 
