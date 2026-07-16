@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # Native (non-container) install script for OxiCloud
-# https://github.com/DioCrafts/OxiCloud
+# https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:        1.9
-# Erstellt am:    2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-07-14 18:10 UTC
+# Version:          1.10
+# Lizenz:           MIT
+# Erstellt am:      2026-07-13 15:59 UTC
+# Zuletzt geändert: 2026-07-16 UTC (Repo-URL AtalayaLabs, systemd-Hardening)
 #
 # Tested target: Debian/Ubuntu with systemd
 # Requires: root privileges (or sudo)
@@ -80,7 +81,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben für Erstelldatum)
-SCRIPT_VERSION="1.9"
+SCRIPT_VERSION="1.10"
 
 # Versionierte Binaries: nach jedem Build wird die Binary nach ihrem
 # Git-Commit-Hash benannt und unter releases/ abgelegt. "current" ist ein
