@@ -6,8 +6,18 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.10
+Version: 1.11
 Lizenz: MIT
+
+---
+
+## Versionshistorie
+
+| Version | Änderung |
+|---|---|
+| 1.9 | Ursprüngliche Fassung |
+| 1.10 | `REPO_URL` konsistent auf `AtalayaLabs/OxiCloud` (inkl. GitHub-API-Aufruf in `resolve_target_ref()`); systemd-Hardening ergänzt (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths`); Kommentar zur `Requires=` vs. `Wants=`-Entscheidung bei `postgresql.service` |
+| 1.11 | Drei Fixes nach Review, siehe Abschnitt „Fixes in 1.11" unten: (1) `set -e`-Fallstrick bei der Node.js-LTS-Ermittlung, (2) DB-Passwort wird jetzt bei jedem Lauf durchgesetzt statt nur beim Erstanlegen, (3) DB-Passwort steht nicht mehr im world-readable systemd-Unit-File |
 
 ---
 
@@ -24,6 +34,90 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Fixes in 1.11
+
+Entstanden aus einem Code-Review, nicht aus einem konkreten Vorfall bei
+diesem Script — aber alle drei Muster waren real bei anderen Skripten des
+Projekts aufgetreten (siehe `migrate-nextcloud-direct.sh`-Changelog).
+
+### 1. `set -e`-Fallstrick bei der Node.js-LTS-Ermittlung
+
+```bash
+LATEST_LTS_MAJOR="$(curl -fsSL https://nodejs.org/dist/index.json | jq -r '...' | sed '...' | cut -d. -f1)"
+```
+
+Das war eine plain Command-Substitution mit Pipe unter `set -e -o pipefail`
+**ohne** Absicherung. Schlug `curl` fehl (nodejs.org nicht erreichbar,
+Netzwerk-Hänger), beendete sich das **ganze Script sofort und
+stillschweigend** an dieser Zeile — der direkt darunterstehende Fallback
+(`LATEST_LTS_MAJOR=24`) wurde **nie erreicht**. Jetzt mit `|| true`
+abgesichert:
+
+```bash
+LATEST_LTS_MAJOR="$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null | jq -r '...' 2>/dev/null | sed '...' | cut -d. -f1)" || true
+```
+
+`LATEST_LTS_MAJOR` bleibt bei einem Fehlschlag einfach leer, der
+nachfolgende `if [[ -z "${LATEST_LTS_MAJOR}" ]]`-Fallback greift dann wie
+ursprünglich vorgesehen.
+
+### 2. DB-Passwort wurde nur beim Erstanlegen der Rolle gesetzt
+
+Vorher:
+```bash
+sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
+  sudo -u postgres psql -c "CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASS}';"
+```
+Existierte die Rolle bereits — z. B. nach einem abgebrochenen vorherigen
+Lauf oder einer aus einem Backup wiederhergestellten Datenbank — mit einem
+**anderen** Passwort als in `/etc/oxicloud/.db_password` gespeichert, blieb
+das unbemerkt, bis `sqlx migrate run` oder der Dienst selbst mit einem
+kryptischen Auth-Fehler scheiterte.
+
+Jetzt läuft bei **jedem** Lauf zusätzlich:
+```bash
+sudo -u postgres psql -c "ALTER ROLE ${DB_USER} WITH PASSWORD '${DB_PASS}';"
+```
+(idempotent, harmlos falls das Passwort ohnehin schon übereinstimmt), plus
+direkt danach ein echter Verbindungstest:
+```bash
+PGPASSWORD="${DB_PASS}" psql -h localhost -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT 1;"
+```
+Schlägt der Test fehl, bricht das Script mit einer konkreten Fehlermeldung
+ab (inkl. Hinweis auf `pg_hba.conf`), statt erst später kryptisch zu
+scheitern.
+
+### 3. DB-Passwort stand im Klartext im systemd-Unit-File
+
+Vorher enthielt die generierte `oxicloud.service` diese Zeile:
+```ini
+Environment=DATABASE_URL=postgres://oxicloud:<klartext-passwort>@localhost:5432/oxicloud
+```
+Unit-Files unter `/etc/systemd/system/` sind standardmäßig `644` — **für
+alle lokalen User lesbar**. Das stand damit im Widerspruch zur sonst
+vorbildlich restriktiven Rechtevergabe des Scripts (`.env` mit `640`,
+`.db_password` mit `600`).
+
+Jetzt wird `DATABASE_URL` stattdessen zusätzlich in die (weiterhin `640`,
+`root:oxicloud`) `.env` geschrieben:
+```bash
+set_env_var "DATABASE_URL" "${DATABASE_URL}" "${CONFIG_DIR}/.env"
+```
+und die Unit lädt sie ausschließlich über `EnvironmentFile=/etc/oxicloud/.env`
+— die `Environment=DATABASE_URL=...`-Zeile im Unit-File ist komplett
+entfernt.
+
+**Falls du eine ältere Installation (vor 1.11) hast**: Nach dem Update mit
+diesem Script einmal prüfen, ob das alte Unit-File noch die Klartext-Zeile
+enthält, und ggf. manuell bereinigen:
+```bash
+grep -n "DATABASE_URL" /etc/systemd/system/oxicloud.service
+```
+Ein erneuter Lauf von `install-oxicloud.sh` schreibt die Unit ohnehin neu
+(mit vorherigem Backup unter `/etc/systemd/system/backups/`).
 
 ---
 
@@ -84,10 +178,13 @@ heißt: Standardwert aus `example.env` bleibt unangetastet.
 2. **Node.js & Rust**: werden installiert bzw. aktualisiert (oder auf die
    gepinnte Version gebracht, falls `NODE_VERSION_PIN`/`RUST_VERSION_PIN`
    gesetzt sind). Ein Versionswechsel bei einem der beiden löst automatisch
-   einen Rebuild aus.
+   einen Rebuild aus. Die Node.js-LTS-Ermittlung ist seit 1.11 gegen einen
+   stillen Script-Abbruch bei Netzwerkproblemen abgesichert (siehe oben).
 3. **Systemuser + PostgreSQL-Rolle/Datenbank**: werden angelegt, falls noch
    nicht vorhanden. `OXICLOUD_HOME` wird bei jedem Lauf rekursiv auf
-   `oxicloud:oxicloud` zurückgesetzt (Selbstheilung).
+   `oxicloud:oxicloud` zurückgesetzt (Selbstheilung). Seit 1.11 wird das
+   DB-Passwort zusätzlich bei **jedem** Lauf per `ALTER ROLE` durchgesetzt
+   und die Verbindung direkt verifiziert (siehe oben).
 4. **Klonen/Aktualisieren**: `git clone`/`git pull` in `OXICLOUD_HOME`.
    Lokale, nicht committete Änderungen an getrackten Dateien werden vor
    jedem Pull als Patch unter `local-changes-backup/` gesichert und dann
@@ -95,15 +192,16 @@ heißt: Standardwert aus `example.env` bleibt unangetastet.
 5. **`.env` erzeugen/ergänzen**: Bei Erstlauf wird `example.env` kopiert.
    Bei bereits bestehender `.env` werden nur **fehlende** Variablen aus
    einer neueren `example.env` automatisch angehängt — vorhandene Werte
-   bleiben unverändert.
+   bleiben unverändert. Seit 1.11 landet `DATABASE_URL` ebenfalls in der
+   `.env` (statt im systemd-Unit-File, siehe oben).
 6. **Migrationen**: `cargo sqlx migrate run` läuft bei **jedem** Lauf
    (idempotent, wendet nur ausstehende Migrationen an).
 7. **Rebuild** (nur falls nötig): Frontend (`npm run build`) und Backend
    (`cargo build --release --locked`) werden neu gebaut. Die entstehende
    Binary wird nach ihrem Git-Commit-Hash versioniert unter `releases/`
    abgelegt; der Symlink `current` zeigt danach darauf.
-8. **systemd**: Unit wird (neu) geschrieben, Dienst bei Bedarf neu
-   gestartet.
+8. **systemd**: Unit wird (neu) geschrieben (jetzt ohne `DATABASE_URL` im
+   Klartext, siehe oben), Dienst bei Bedarf neu gestartet.
 
 ---
 
@@ -111,11 +209,21 @@ heißt: Standardwert aus `example.env` bleibt unangetastet.
 
 | Was | Mechanismus |
 |---|---|
-| DB-Passwort | Persistiert in `/etc/oxicloud/.db_password` (`chmod 600`), wiederverwendet statt neu generiert |
+| DB-Passwort | Persistiert in `/etc/oxicloud/.db_password` (`chmod 600`), wiederverwendet statt neu generiert — **und seit 1.11 bei jedem Lauf aktiv gegen die Datenbank durchgesetzt** (`ALTER ROLE`), nicht nur beim Erstanlegen vorausgesetzt |
 | Bestehende `.env`-Werte | Nur fehlende Variablen werden ergänzt, nichts wird überschrieben |
 | Lokale, nicht committete Änderungen in `OXICLOUD_HOME` | Werden vor jedem Pull als Patch unter `local-changes-backup/` gesichert (dann verworfen, da das Verzeichnis ausschließlich vom Script verwaltet werden soll) |
 | `.env`, systemd-Unit, `/etc/fstab` | Vor jedem Überschreiben wird eine Zeitstempel-Kopie in einem `backups/`-Unterordner neben der jeweiligen Datei angelegt |
 | Alte Releases | Über `KEEP_RELEASES` gesteuert; die aktive Version wird nie automatisch gelöscht |
+
+---
+
+## Sicherheit: Datei-Rechte im Überblick
+
+| Datei | Rechte | Enthält |
+|---|---|---|
+| `/etc/oxicloud/.env` | `640`, `root:oxicloud` | `DATABASE_URL`, `OXICLOUD_DB_CONNECTION_STRING`, weitere `.env`-Werte |
+| `/etc/oxicloud/.db_password` | `600`, root | DB-Passwort im Klartext |
+| `/etc/systemd/system/oxicloud.service` | `644` (systemd-Standard, für alle lesbar) | **Seit 1.11 kein Passwort mehr** — vorher enthielt es `DATABASE_URL` im Klartext |
 
 ---
 
@@ -197,13 +305,25 @@ mit identischem Release-Stand. Siehe Kommentar direkt über `REPO_URL` im
 Script — einmal selbst verifizieren, welcher Remote für euch verbindlich
 sein soll.
 
+**„Konnte aktuelle Node.js-Version nicht ermitteln, falle zurück auf Node 24" (neu sichtbar seit 1.11):**
+Normales, beabsichtigtes Verhalten bei Netzwerkproblemen zu nodejs.org.
+Vor 1.11 hätte genau dieser Fall das Script stattdessen stillschweigend
+komplett beendet, ohne dass diese Meldung je erschienen wäre — sie war
+zwar im Code vorgesehen, aber durch den `set -e`-Fallstrick unerreichbar.
+Kein Handlungsbedarf, außer eine bestimmte Node-Version wird zwingend
+benötigt (`NODE_VERSION_PIN` setzen).
+
+**„Verbindung zur Datenbank ... schlägt fehl, obwohl Rolle/Datenbank/
+Passwort gerade eben gesetzt wurden" (neu in 1.11):**
+Meist eine `pg_hba.conf`-Authentifizierungsmethode, die kein
+Passwort-Login für `localhost` erlaubt (z. B. `peer` statt `md5`/
+`scram-sha-256`). Prüfen:
+```bash
+cat /etc/postgresql/*/main/pg_hba.conf | grep -v '^#'
+```
+Zeile für `host ... 127.0.0.1/32 ...` bzw. `local` auf `md5` oder
+`scram-sha-256` umstellen, danach `systemctl restart postgresql`.
+
 ---
-
-## Versionshistorie
-
-| Version | Änderung |
-|---|---|
-| 1.9 | Ursprüngliche Fassung |
-| 1.10 | `REPO_URL` konsistent auf `AtalayaLabs/OxiCloud` (inkl. GitHub-API-Aufruf in `resolve_target_ref()`); systemd-Hardening ergänzt (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths`); Kommentar zur `Requires=` vs. `Wants=`-Entscheidung bei `postgresql.service` |
 
 Lizenz: **MIT**
