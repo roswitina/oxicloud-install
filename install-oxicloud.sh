@@ -3,10 +3,35 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.10
+# Version:          1.11
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-07-16 UTC (Repo-URL AtalayaLabs, systemd-Hardening)
+# Zuletzt geändert: 2026-07-19 UTC (drei Fixes, siehe Changelog)
+#
+# Changelog:
+#   1.11 - Drei Fixes nach Review:
+#          1) Node.js-LTS-Ermittlung war eine plain Command-Substitution
+#             mit Pipe unter "set -e -o pipefail" - schlug curl fehl (z.B.
+#             nodejs.org nicht erreichbar), beendete sich das GANZE Skript
+#             sofort und stillschweigend an dieser Stelle, der direkt
+#             darunterstehende Fallback (LATEST_LTS_MAJOR=24) wurde nie
+#             erreicht. Jetzt mit "|| true" abgesichert, Fallback greift.
+#          2) DB-Passwort wurde nur beim ERSTMALIGEN Anlegen der Rolle
+#             gesetzt ("CREATE ROLE ... || true"-Logik) - existierte die
+#             Rolle bereits (z.B. nach einem abgebrochenen Lauf oder einer
+#             wiederhergestellten DB) mit einem ANDEREN Passwort als in
+#             /etc/oxicloud/.db_password gespeichert, blieb das unbemerkt,
+#             bis sqlx/der Dienst selbst mit einem kryptischen Auth-Fehler
+#             scheiterte. Jetzt: "ALTER ROLE ... WITH PASSWORD" läuft bei
+#             JEDEM Lauf, garantiert Übereinstimmung; zusätzlich ein
+#             expliziter Verbindungstest mit klarer Fehlermeldung.
+#          3) Das DB-Passwort stand im Klartext direkt im systemd-Unit-File
+#             ("Environment=DATABASE_URL=..."), das standardmäßig für ALLE
+#             lokalen User lesbar ist (644) - im Gegensatz zur bewusst
+#             restriktiv geschützten .env (640)/.db_password (600). Jetzt
+#             wird DATABASE_URL stattdessen in die .env geschrieben und nur
+#             noch über "EnvironmentFile=" geladen, nicht mehr inline im
+#             Unit-File.
 #
 # Tested target: Debian/Ubuntu with systemd
 # Requires: root privileges (or sudo)
@@ -81,7 +106,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben für Erstelldatum)
-SCRIPT_VERSION="1.10"
+SCRIPT_VERSION="1.11"
 
 # Versionierte Binaries: nach jedem Build wird die Binary nach ihrem
 # Git-Commit-Hash benannt und unter releases/ abgelegt. "current" ist ein
@@ -234,7 +259,13 @@ if [[ -n "${NODE_VERSION_PIN}" ]]; then
   LATEST_LTS_MAJOR="${NODE_VERSION_PIN}"
 else
   echo "==> Ermittle aktuelle Node.js LTS-Version..."
-  LATEST_LTS_MAJOR="$(curl -fsSL https://nodejs.org/dist/index.json | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/^v//' | cut -d. -f1)"
+  # Fix (1.11): war eine plain Command-Substitution mit Pipe unter
+  # "set -e -o pipefail" OHNE Absicherung - schlug curl fehl, beendete sich
+  # das GANZE Skript sofort und stillschweigend an dieser Zeile, der
+  # Fallback direkt darunter wurde nie erreicht. "|| true" am Ende erzwingt
+  # einen Exit-Code 0 für die gesamte Pipe, LATEST_LTS_MAJOR bleibt dann
+  # einfach leer und der folgende Fallback greift wie vorgesehen.
+  LATEST_LTS_MAJOR="$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null | jq -r '[.[] | select(.lts != false)][0].version' 2>/dev/null | sed 's/^v//' | cut -d. -f1)" || true
 
   if [[ -z "${LATEST_LTS_MAJOR}" ]]; then
     echo "    Konnte aktuelle Node.js-Version nicht ermitteln, falle zurück auf Node 24." >&2
@@ -278,10 +309,37 @@ sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | 
 sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
   sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
 
+# Fix (1.11): Passwort bei JEDEM Lauf durchsetzen, nicht nur beim erstmaligen
+# Anlegen der Rolle. Ohne das konnte die Rolle bereits mit einem ANDEREN
+# Passwort existieren (z.B. nach einem abgebrochenen vorherigen Lauf oder
+# einer wiederhergestellten Datenbank) als in .db_password gespeichert -
+# das fiel dann erst bei sqlx/dem laufenden Dienst mit einem kryptischen
+# Auth-Fehler auf. ALTER ROLE ist idempotent und stört nicht, falls das
+# Passwort ohnehin schon übereinstimmt.
+echo "==> Stelle sicher, dass das DB-Passwort mit ${DB_PASS_FILE} übereinstimmt..."
+sudo -u postgres psql -c "ALTER ROLE ${DB_USER} WITH PASSWORD '${DB_PASS}';" >/dev/null
+
 if [[ "${DB_PASS_IS_NEW}" -eq 1 ]]; then
   echo -n "${DB_PASS}" > "${DB_PASS_FILE}"
   chmod 600 "${DB_PASS_FILE}"
 fi
+
+DATABASE_URL="postgres://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}"
+
+# Fix (1.11): expliziter Verbindungstest MIT der tatsächlichen Ziel-DB und
+# dem Passwort aus DATABASE_URL - fängt Auth-/Netzwerkprobleme sofort mit
+# klarer Meldung ab, statt erst beim späteren "sqlx migrate run" oder beim
+# Dienststart kryptisch zu scheitern.
+echo "==> Teste Datenbankverbindung mit den ermittelten Zugangsdaten..."
+if ! PGPASSWORD="${DB_PASS}" psql -h localhost -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT 1;" >/dev/null 2>&1; then
+  echo "FEHLER: Verbindung zur Datenbank '${DB_NAME}' als '${DB_USER}' schlägt fehl," >&2
+  echo "obwohl Rolle/Datenbank/Passwort gerade eben gesetzt wurden." >&2
+  echo "Mögliche Ursachen: PostgreSQL-Authentifizierungsmethode in pg_hba.conf" >&2
+  echo "erlaubt kein Passwort-Login für 'localhost' (z.B. 'peer' statt 'md5'/'scram-sha-256')." >&2
+  echo "Prüfen: cat /etc/postgresql/*/main/pg_hba.conf | grep -v '^#'" >&2
+  exit 1
+fi
+echo "    Datenbankverbindung erfolgreich verifiziert."
 
 echo "==> Lege Systembenutzer '${OXICLOUD_USER}' an..."
 id -u "${OXICLOUD_USER}" &>/dev/null || useradd -r -M -d "${OXICLOUD_HOME}" -s /usr/sbin/nologin "${OXICLOUD_USER}"
@@ -425,7 +483,6 @@ if [[ "${LAST_BUILD_OK}" != "${EXPECTED_MARKER}" ]]; then
 fi
 
 echo "==> Erzeuge Konfigurationsverzeichnis /etc/oxicloud und .env..."
-DATABASE_URL="postgres://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}"
 CONFIG_DIR="/etc/oxicloud"
 STORAGE_DIR="/mnt/oxicloud-data/storage"
 STATIC_DIR="${OXICLOUD_HOME}/static"
@@ -479,6 +536,13 @@ set_env_var() {
 
 backup_file "${CONFIG_DIR}/.env"
 set_env_var "OXICLOUD_DB_CONNECTION_STRING" "${DATABASE_URL}" "${CONFIG_DIR}/.env"
+# Fix (1.11): DATABASE_URL zusätzlich in die (chmod 640, root:oxicloud
+# geschützte) .env schreiben, statt sie später im systemd-Unit-File inline
+# als "Environment=DATABASE_URL=..." abzulegen. Unit-Files unter
+# /etc/systemd/system/ sind standardmäßig 644 (für ALLE lokalen User
+# lesbar) - das Passwort wäre damit trivial auslesbar gewesen
+# ("cat /etc/systemd/system/oxicloud.service" bzw. "systemctl show").
+set_env_var "DATABASE_URL" "${DATABASE_URL}" "${CONFIG_DIR}/.env"
 set_env_var "OXICLOUD_STORAGE_PATH" "${STORAGE_DIR}" "${CONFIG_DIR}/.env"
 set_env_var "OXICLOUD_STATIC_PATH" "${STATIC_DIR}" "${CONFIG_DIR}/.env"
 
@@ -595,7 +659,6 @@ Type=simple
 User=${OXICLOUD_USER}
 WorkingDirectory=${OXICLOUD_HOME}
 EnvironmentFile=/etc/oxicloud/.env
-Environment=DATABASE_URL=${DATABASE_URL}
 ExecStart=${BIN_PATH}
 Restart=on-failure
 RestartSec=5
