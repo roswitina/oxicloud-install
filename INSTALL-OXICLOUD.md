@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.11
+Version: 1.12
 Lizenz: MIT
 
 ---
@@ -18,6 +18,7 @@ Lizenz: MIT
 | 1.9 | Ursprüngliche Fassung |
 | 1.10 | `REPO_URL` konsistent auf `AtalayaLabs/OxiCloud` (inkl. GitHub-API-Aufruf in `resolve_target_ref()`); systemd-Hardening ergänzt (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths`); Kommentar zur `Requires=` vs. `Wants=`-Entscheidung bei `postgresql.service` |
 | 1.11 | Drei Fixes nach Review, siehe Abschnitt „Fixes in 1.11" unten: (1) `set -e`-Fallstrick bei der Node.js-LTS-Ermittlung, (2) DB-Passwort wird jetzt bei jedem Lauf durchgesetzt statt nur beim Erstanlegen, (3) DB-Passwort steht nicht mehr im world-readable systemd-Unit-File |
+| 1.12 | Fix nach fehlgeschlagenem Testlauf in einem LXC-Container, siehe Abschnitt „Fix in 1.12" unten: `sudo` fehlte in der Preflight-Paketliste und war auf einem minimalen LXC-Template nicht vorinstalliert — Script brach beim ersten `sudo -u ...`-Aufruf mit `command not found` ab |
 
 ---
 
@@ -34,6 +35,52 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Fix in 1.12
+
+Entstanden aus einem echten fehlgeschlagenen Testlauf: Installation in
+einem **LXC-Container** (Proxmox, Debian Trixie) brach mitten in der
+PostgreSQL-Rolle-Anlage ab, während dieselbe Script-Version auf einer
+vollwertigen VM (DietPi, x86) anstandslos durchlief.
+
+### `sudo` fehlte in der Preflight-Paketliste
+
+Ursache im Install-Log:
+```
+==> Lege PostgreSQL-Rolle und Datenbank an (falls noch nicht vorhanden)...
+./install-oxicloud.sh: line 306: sudo: command not found
+```
+
+Viele minimale LXC-Templates (insbesondere die offiziellen
+Proxmox-Debian-Templates) bringen `sudo` **nicht** vorinstalliert mit — im
+Gegensatz zu vollwertigen VMs oder Images wie DietPi, wo es praktisch immer
+vorhanden ist. Root zu sein (der `EUID`-Check am Scriptanfang) garantiert
+nicht, dass der Befehl `sudo` selbst existiert. Das Script verlässt sich
+aber an sehr vielen Stellen auf `sudo -u ...` — DB-Rolle anlegen,
+Repo klonen, Rust/Cargo-Aufrufe, `npm run build`, uvm. — daher scheiterte
+der Lauf beim allerersten `sudo`-Aufruf.
+
+Vorher:
+```bash
+REQUIRED_APT_PACKAGES=(git curl openssl build-essential pkg-config libssl-dev postgresql postgresql-contrib ca-certificates jq)
+```
+
+Jetzt:
+```bash
+REQUIRED_APT_PACKAGES=(sudo git curl openssl build-essential pkg-config libssl-dev postgresql postgresql-contrib ca-certificates jq)
+```
+
+Der bestehende Preflight-Mechanismus (fehlende Pakete automatisch per
+`apt-get install` nachziehen) deckt `sudo` damit von Anfang an mit ab,
+noch bevor der erste `sudo -u ...`-Aufruf im Script erreicht wird.
+
+**Falls du bereits einen fehlgeschlagenen Lauf mit einer älteren Version
+in einem solchen Container hattest:** einfach `apt-get install -y sudo`
+manuell nachholen oder das Script erneut mit Version 1.12 ausführen —
+Idempotenz sorgt dafür, dass der Rest des vorherigen (Teil-)Laufs sauber
+fortgesetzt wird.
 
 ---
 
@@ -124,7 +171,9 @@ Ein erneuter Lauf von `install-oxicloud.sh` schreibt die Unit ohnehin neu
 ## Voraussetzungen
 
 - Debian/Ubuntu mit systemd
-- root-Zugriff (bzw. `sudo`)
+- root-Zugriff (bzw. `sudo` — wird seit 1.12 falls nötig selbst
+  nachinstalliert, siehe „Fix in 1.12" oben; **auf minimalen LXC-Templates
+  vorher trotzdem sinnvoll, einmal manuell zu prüfen, ob es schon da ist**)
 - Internetzugang auf dem Zielserver (für `apt`, GitHub, crates.io, npm-Registry, rustup, NodeSource)
 - Ausreichend Ressourcen zum Kompilieren — siehe Abschnitt „Ressourcenbedarf" unten. Fehlt genug RAM, legt das Script selbst einen temporären Swapfile an.
 
@@ -172,9 +221,12 @@ heißt: Standardwert aus `example.env` bleibt unangetastet.
 
 ## Ablauf im Detail
 
-1. **Preflight-Check**: `git`, `curl`, `jq`, `openssl`, `postgresql`,
-   `postgresql-contrib`, `build-essential`, `pkg-config`, `libssl-dev`,
-   `ca-certificates` werden geprüft und fehlende per `apt` nachinstalliert.
+1. **Preflight-Check**: `sudo`, `git`, `curl`, `jq`, `openssl`,
+   `postgresql`, `postgresql-contrib`, `build-essential`, `pkg-config`,
+   `libssl-dev`, `ca-certificates` werden geprüft und fehlende per `apt`
+   nachinstalliert. Seit 1.12 gehört `sudo` mit zur Liste (siehe „Fix in
+   1.12" oben) — vorher fehlte es hier, obwohl das Script ab Schritt 3 an
+   vielen Stellen darauf angewiesen ist.
 2. **Node.js & Rust**: werden installiert bzw. aktualisiert (oder auf die
    gepinnte Version gebracht, falls `NODE_VERSION_PIN`/`RUST_VERSION_PIN`
    gesetzt sind). Ein Versionswechsel bei einem der beiden löst automatisch
@@ -282,6 +334,15 @@ Jeder Lauf des Scripts hängt zusätzlich an `/var/log/oxicloud-install.log` an.
 ---
 
 ## Troubleshooting
+
+**`./install-oxicloud.sh: line N: sudo: command not found` (behoben seit 1.12):**
+Trat vor allem in minimalen LXC-Containern auf (z. B. offizielle
+Proxmox-Debian-Templates), die `sudo` standardmäßig nicht mitbringen — im
+Gegensatz zu vollwertigen VMs/Images. Seit Version 1.12 installiert der
+Preflight-Check `sudo` automatisch mit, falls es fehlt (siehe „Fix in
+1.12" oben). Bei einer älteren Script-Version: `apt-get install -y sudo`
+manuell ausführen und das Script erneut starten — dank Idempotenz setzt es
+sauber dort fort, wo es abgebrochen war.
 
 **Build bricht mit `signal: 9, SIGKILL` ab:**
 Fast immer OOM (zu wenig RAM). Das Script versucht das per Auto-Swapfile
