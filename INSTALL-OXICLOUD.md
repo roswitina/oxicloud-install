@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.13
+Version: 1.14
 Lizenz: MIT
 
 ---
@@ -20,6 +20,7 @@ Lizenz: MIT
 | 1.11 | Drei Fixes nach Review, siehe Abschnitt „Fixes in 1.11" unten: (1) `set -e`-Fallstrick bei der Node.js-LTS-Ermittlung, (2) DB-Passwort wird jetzt bei jedem Lauf durchgesetzt statt nur beim Erstanlegen, (3) DB-Passwort steht nicht mehr im world-readable systemd-Unit-File |
 | 1.12 | Fix nach fehlgeschlagenem Testlauf in einem LXC-Container, siehe Abschnitt „Fix in 1.12" unten: `sudo` fehlte in der Preflight-Paketliste und war auf einem minimalen LXC-Template nicht vorinstalliert — Script brach beim ersten `sudo -u ...`-Aufruf mit `command not found` ab |
 | 1.13 | Sieben Robustheits-Verbesserungen, siehe Abschnitt „Neuerungen in 1.13" unten: automatisches Health-Check-Rollback, DB-Backup vor jeder Migration, Log-Rotation fürs Install-Log, `git fetch`+`reset --hard` statt `pull`, harter Abbruch bei kritisch wenig Diskspace, Firewall-Hinweis bei `0.0.0.0`/`::`, optionale Fehler-Benachrichtigung per Webhook |
+| 1.14 | Aufbewahrungsgrenze für die generischen Zeitstempel-Backups (`.env`, systemd-Unit, `/etc/fstab`), siehe Abschnitt „Neuerung in 1.14" unten: `backup_file()` bereinigte bisher nie, wuchs also unbegrenzt — besonders relevant, da `.env` pro Lauf potenziell zweimal gesichert wird |
 
 ---
 
@@ -36,6 +37,31 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerung in 1.14
+
+### Aufbewahrungsgrenze für generische Datei-Backups
+
+`backup_file()` — genutzt für `/etc/oxicloud/.env`, `/etc/systemd/system/oxicloud.service`
+und `/etc/fstab` (beim Swapfile-Handling) — legte bei jedem Aufruf eine
+weitere Zeitstempel-Kopie unter `<verzeichnis>/backups/` an, bereinigte
+aber nie etwas. Im Unterschied zu `DB_BACKUP_KEEP` (Abschnitt 1.13) und
+`KEEP_RELEASES` wuchs dieses Verzeichnis damit unbegrenzt — besonders
+relevant bei `.env`, die pro Lauf potenziell **zweimal** gesichert wird
+(einmal beim Ergänzen neuer Variablen aus `example.env`, einmal direkt
+danach vor dem Setzen von `DATABASE_URL` etc.).
+
+Jetzt bereinigt `backup_file()` nach jedem Aufruf automatisch auf die
+neuesten `GENERIC_BACKUP_KEEP` Stände **pro Datei** (Standard `10`,
+hartkodiert direkt über der Funktion, nicht im Konfigurationsblock —
+analog zu `DISK_ABORT_THRESHOLD_GB`/`DB_BACKUP_KEEP`). Zusätzlich gibt es
+jetzt einen Kollisionsschutz: Fallen zwei Backups derselben Datei in
+dieselbe Sekunde (Zeitstempel hat nur Sekundenauflösung — genau der Fall
+bei den zwei `.env`-Backups pro Lauf), wird die PID an den Dateinamen
+angehängt (`.env.<timestamp>-<pid>.bak`), statt dass der zweite Aufruf den
+ersten Backup-Stand stillschweigend überschreibt.
 
 ---
 
@@ -333,6 +359,7 @@ Nutzereinstellung sind):
 | `DISK_ABORT_THRESHOLD_GB` | `5` | Unterhalb dieser freien GB im Ressourcen-Check bricht das Script vor dem Build hart ab |
 | `DB_BACKUP_KEEP` | `10` | Wie viele DB-Backups unter `/etc/oxicloud/db-backups` behalten werden |
 | `HEALTH_RETRIES` | `10` | Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild versucht wird, bevor ein Rollback ausgelöst wird |
+| `GENERIC_BACKUP_KEEP` *(neu in 1.14)* | `10` | Wie viele Zeitstempel-Backups **pro Datei** in den jeweiligen `backups/`-Unterordnern behalten werden (`.env`, systemd-Unit, `/etc/fstab`) |
 
 ---
 
@@ -399,7 +426,7 @@ Nutzereinstellung sind):
 | DB-Passwort | Persistiert in `/etc/oxicloud/.db_password` (`chmod 600`), wiederverwendet statt neu generiert — **und seit 1.11 bei jedem Lauf aktiv gegen die Datenbank durchgesetzt** (`ALTER ROLE`), nicht nur beim Erstanlegen vorausgesetzt |
 | Bestehende `.env`-Werte | Nur fehlende Variablen werden ergänzt, nichts wird überschrieben |
 | Lokale, nicht committete Änderungen in `OXICLOUD_HOME` | Werden vor jedem Pull/Reset als Patch unter `local-changes-backup/` gesichert (dann verworfen, da das Verzeichnis ausschließlich vom Script verwaltet werden soll) |
-| `.env`, systemd-Unit, `/etc/fstab` | Vor jedem Überschreiben wird eine Zeitstempel-Kopie in einem `backups/`-Unterordner neben der jeweiligen Datei angelegt |
+| `.env`, systemd-Unit, `/etc/fstab` | Vor jedem Überschreiben wird eine Zeitstempel-Kopie in einem `backups/`-Unterordner neben der jeweiligen Datei angelegt — seit 1.14 begrenzt auf die neuesten `GENERIC_BACKUP_KEEP` Stände pro Datei, vorher unbegrenztes Wachstum |
 | Alte Releases | Über `KEEP_RELEASES` gesteuert; die aktive Version wird nie automatisch gelöscht |
 | DB-Backups *(neu in 1.13)* | Unter `/etc/oxicloud/db-backups`, über `DB_BACKUP_KEEP` (Standard 10) gesteuert |
 
