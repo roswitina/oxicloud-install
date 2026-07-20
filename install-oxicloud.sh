@@ -3,12 +3,19 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.13
+# Version:          1.14
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-07-20 UTC (Health-Check/Rollback, DB-Backup, u.a.)
+# Zuletzt geändert: 2026-07-20 UTC (Aufbewahrungsgrenze für generische Backups)
 #
 # Changelog:
+#   1.14 - backup_file() (nutzt für .env, systemd-Unit, /etc/fstab) bereinigt
+#          jetzt alte Zeitstempel-Backups (GENERIC_BACKUP_KEEP, Standard 10),
+#          analog zu DB_BACKUP_KEEP/KEEP_RELEASES. Vorher wuchs das
+#          "backups"-Unterverzeichnis unbegrenzt, insbesondere weil .env pro
+#          Lauf potenziell zweimal gesichert wird. Zusätzlich Kollisionsschutz
+#          für den Fall, dass zwei Backups derselben Datei in dieselbe
+#          Sekunde fallen (Zeitstempel hat nur Sekundenauflösung).
 #   1.13 - Sieben Robustheits-Verbesserungen nach Review:
 #          1) Health-Check nach Neustart + automatisches Rollback: schlägt
 #             der Health-Check (systemd aktiv + HTTP-Antwort auf dem
@@ -148,7 +155,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben für Erstelldatum)
-SCRIPT_VERSION="1.13"
+SCRIPT_VERSION="1.14"
 
 # Versionierte Binaries: nach jedem Build wird die Binary nach ihrem
 # Git-Commit-Hash benannt und unter releases/ abgelegt. "current" ist ein
@@ -262,15 +269,39 @@ echo ""
 echo "===== Install-Lauf gestartet: $(date '+%Y-%m-%d %H:%M:%S') (Script-Version ${SCRIPT_VERSION}) ====="
 
 # ---- Backup-Helfer: legt vor jedem Überschreiben eine Zeitstempel-Kopie an -
+# Betrifft .env, die systemd-Unit und /etc/fstab. Bereinigt seit 1.14
+# zusätzlich alte Backups (analog zu DB_BACKUP_KEEP/KEEP_RELEASES) - vorher
+# wuchs dieses Verzeichnis unbegrenzt, v.a. da .env pro Lauf potenziell
+# zweimal gesichert wird (einmal beim Ergänzen neuer Variablen aus
+# example.env, einmal direkt danach vor dem Setzen von DATABASE_URL etc.).
+GENERIC_BACKUP_KEEP=10
 backup_file() {
   local file="$1"
   if [[ -f "${file}" ]]; then
     local backup_dir="$(dirname "${file}")/backups"
     mkdir -p "${backup_dir}"
     local ts="$(date '+%Y%m%d-%H%M%S')"
-    local backup_path="${backup_dir}/$(basename "${file}").${ts}.bak"
+    local base="$(basename "${file}")"
+    local backup_path="${backup_dir}/${base}.${ts}.bak"
+    # Kollisionsschutz: fallen zwei Aufrufe für dieselbe Datei in dieselbe
+    # Sekunde (z.B. die zwei .env-Backups pro Lauf), würde der zweite sonst
+    # den ersten Backup-Stand stillschweigend überschreiben, da der
+    # Zeitstempel nur Sekundenauflösung hat.
+    if [[ -e "${backup_path}" ]]; then
+      backup_path="${backup_dir}/${base}.${ts}-$$.bak"
+    fi
     cp -p "${file}" "${backup_path}"
     echo "    Backup angelegt: ${backup_path}"
+
+    if [[ "${GENERIC_BACKUP_KEEP}" -gt 0 ]]; then
+      local backup_count
+      backup_count="$(find "${backup_dir}" -maxdepth 1 -type f -name "${base}.*.bak" | wc -l)"
+      if [[ "${backup_count}" -gt "${GENERIC_BACKUP_KEEP}" ]]; then
+        find "${backup_dir}" -maxdepth 1 -type f -name "${base}.*.bak" -printf '%T@ %p\n' \
+          | sort -rn | tail -n +"$((GENERIC_BACKUP_KEEP + 1))" | cut -d' ' -f2- \
+          | while IFS= read -r old_backup; do rm -f "${old_backup}"; done
+      fi
+    fi
   fi
 }
 
