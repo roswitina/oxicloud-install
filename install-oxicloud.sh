@@ -208,6 +208,24 @@ ENABLE_PLUGINS=false
 # Beispiel (Slack/Mattermost-kompatibler Incoming-Webhook):
 #   NOTIFY_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ"
 NOTIFY_WEBHOOK_URL=""
+
+# Wie viele Zeitstempel-Backups PRO DATEI in den jeweiligen "backups/"-
+# Unterordnern behalten werden (betrifft .env, systemd-Unit, /etc/fstab).
+# 0 = keine Bereinigung, alle Backups werden dauerhaft behalten.
+GENERIC_BACKUP_KEEP=10
+
+# Wie viele Datenbank-Backups (pg_dump, vor jeder Migration) unter
+# /etc/oxicloud/db-backups behalten werden. 0 = keine Bereinigung.
+DB_BACKUP_KEEP=10
+
+# Unterhalb dieser freien GB unter ${OXICLOUD_HOME%/*} bricht das Script
+# VOR dem Build hart ab, statt nur zu warnen (siehe Ressourcen-Check).
+DISK_ABORT_THRESHOLD_GB=5
+
+# Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild
+# versucht wird, bevor automatisch auf das vorherige Release zurückgerollt
+# wird (siehe Health-Check-Abschnitt weiter unten).
+HEALTH_RETRIES=10
 ### ---------------------------------------------------------------------------
 
 # ---- Fehler-Benachrichtigung (optional) ------------------------------------
@@ -270,11 +288,11 @@ echo "===== Install-Lauf gestartet: $(date '+%Y-%m-%d %H:%M:%S') (Script-Version
 
 # ---- Backup-Helfer: legt vor jedem Überschreiben eine Zeitstempel-Kopie an -
 # Betrifft .env, die systemd-Unit und /etc/fstab. Bereinigt seit 1.14
-# zusätzlich alte Backups (analog zu DB_BACKUP_KEEP/KEEP_RELEASES) - vorher
-# wuchs dieses Verzeichnis unbegrenzt, v.a. da .env pro Lauf potenziell
-# zweimal gesichert wird (einmal beim Ergänzen neuer Variablen aus
-# example.env, einmal direkt danach vor dem Setzen von DATABASE_URL etc.).
-GENERIC_BACKUP_KEEP=10
+# zusätzlich alte Backups (GENERIC_BACKUP_KEEP, siehe Konfigurationsblock
+# am Scriptanfang) - vorher wuchs dieses Verzeichnis unbegrenzt, v.a. da
+# .env pro Lauf potenziell zweimal gesichert wird (einmal beim Ergänzen
+# neuer Variablen aus example.env, einmal direkt danach vor dem Setzen
+# von DATABASE_URL etc.).
 backup_file() {
   local file="$1"
   if [[ -f "${file}" ]]; then
@@ -338,8 +356,8 @@ echo ""
 # Bisher gab es nur die Warnung oben, der Build lief trotzdem an und scheiterte
 # dann oft erst mitten in "cargo build" (schlechtester Zeitpunkt: viel Zeit
 # investiert, Log unübersichtlich). Ein harter Schwellwert deutlich unter der
-# Empfehlung bricht stattdessen sofort und mit klarer Meldung ab.
-DISK_ABORT_THRESHOLD_GB=5
+# Empfehlung (DISK_ABORT_THRESHOLD_GB, siehe Konfigurationsblock am
+# Scriptanfang) bricht stattdessen sofort und mit klarer Meldung ab.
 if [[ "${ACTUAL_DISK_GB}" -lt "${DISK_ABORT_THRESHOLD_GB}" ]]; then
   echo "FEHLER: Nur noch ca. ${ACTUAL_DISK_GB} GB frei unter ${OXICLOUD_HOME%/*}" >&2
   echo "(kritischer Schwellwert: ${DISK_ABORT_THRESHOLD_GB} GB). Breche vor dem Build ab," >&2
@@ -742,7 +760,6 @@ echo "==> Erstelle Datenbank-Backup vor der Migration..."
 # eine schlecht getestete Migration (z.B. aus einem neuen Release) kann sonst
 # Daten unwiederbringlich zerstören. Ein Dump direkt davor macht das reversibel.
 DB_BACKUP_DIR="/etc/oxicloud/db-backups"
-DB_BACKUP_KEEP=10
 mkdir -p "${DB_BACKUP_DIR}"
 DB_BACKUP_FILE="${DB_BACKUP_DIR}/${DB_NAME}-$(date '+%Y%m%d-%H%M%S').sql.gz"
 if sudo -u postgres pg_dump "${DB_NAME}" | gzip > "${DB_BACKUP_FILE}"; then
@@ -890,7 +907,6 @@ fi
 # das zurückgerollt werden könnte.
 if [[ "${NEED_BUILD}" -eq 1 && "${OLD_REV}" != "none" ]]; then
   echo "==> Prüfe, ob der Dienst nach dem Neustart tatsächlich läuft und antwortet..."
-  HEALTH_RETRIES=10
   HEALTH_OK=0
   for i in $(seq 1 "${HEALTH_RETRIES}"); do
     sleep 2
