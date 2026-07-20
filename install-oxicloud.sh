@@ -3,12 +3,43 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.12
+# Version:          1.13
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-07-19 UTC (Fix nach fehlgeschlagenem LXC-Testlauf)
+# Zuletzt geändert: 2026-07-20 UTC (Health-Check/Rollback, DB-Backup, u.a.)
 #
 # Changelog:
+#   1.13 - Sieben Robustheits-Verbesserungen nach Review:
+#          1) Health-Check nach Neustart + automatisches Rollback: schlägt
+#             der Health-Check (systemd aktiv + HTTP-Antwort auf dem
+#             konfigurierten Port) nach einem Rebuild fehl, wird "current"
+#             automatisch auf das vorherige Release unter releases/
+#             zurückgesetzt und der Dienst erneut gestartet, statt einfach
+#             auf dem defekten Release stehen zu bleiben.
+#          2) Automatisches DB-Backup (pg_dump, gzip) direkt vor jeder
+#             Migration unter /etc/oxicloud/db-backups, inkl. Aufbewahrung
+#             der letzten DB_BACKUP_KEEP Stände. Schlägt das Backup fehl,
+#             wird die Migration gar nicht erst versucht.
+#          3) Logrotate-Konfiguration für /var/log/oxicloud-install.log wird
+#             automatisch angelegt (falls logrotate verfügbar ist), damit
+#             das Log bei wiederholten/automatisierten Läufen nicht
+#             unbegrenzt wächst.
+#          4) "git pull origin main" durch "git fetch" + "reset --hard
+#             origin/main" ersetzt, damit ein divergierter main (z.B. nach
+#             einem Force-Push upstream) den Lauf nicht mehr scheitern
+#             lässt - konsistent zur bestehenden Philosophie, dass
+#             /opt/oxicloud exklusiv vom Script verwaltet wird.
+#          5) Harter Abbruch VOR dem Build, falls weniger als
+#             DISK_ABORT_THRESHOLD_GB frei sind, statt nur einer Warnung -
+#             vermeidet einen mittendrin abgebrochenen "cargo build" durch
+#             währenddessen vollgelaufene Platte.
+#          6) Hinweis/Prüfung auf offene Firewall-Regeln, falls
+#             ENV_OVERRIDE_SERVER_HOST auf 0.0.0.0 (bzw. ::) gesetzt wird,
+#             damit der Port nicht versehentlich offen ins Internet zeigt.
+#          7) Optionale Fehler-Benachrichtigung per Webhook (NOTIFY_WEBHOOK_URL):
+#             bei jedem Lauf mit Exit-Code != 0 wird, falls konfiguriert,
+#             eine kurze Meldung per POST verschickt - wichtig, falls das
+#             Script unbeaufsichtigt per Cron läuft.
 #   1.12 - Fix nach fehlgeschlagenem Testlauf in einem LXC-Container
 #          (Proxmox, Debian Trixie): "sudo" fehlte in der Preflight-
 #          Paketliste. Minimale LXC-Templates bringen "sudo" oft NICHT
@@ -117,7 +148,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben für Erstelldatum)
-SCRIPT_VERSION="1.12"
+SCRIPT_VERSION="1.13"
 
 # Versionierte Binaries: nach jedem Build wird die Binary nach ihrem
 # Git-Commit-Hash benannt und unter releases/ abgelegt. "current" ist ein
@@ -161,7 +192,37 @@ OXICLOUD_VERSION_PIN=""
 # false (Standard) = wie bisher, kein Plugin-Feature, .env bleibt unangetastet.
 # true = baut mit "--features plugins" und setzt OXICLOUD_ENABLE_PLUGINS=true.
 ENABLE_PLUGINS=false
+
+# Optionaler Webhook, der bei einem fehlgeschlagenen Lauf (Exit-Code != 0)
+# aufgerufen wird - wichtig, falls das Script unbeaufsichtigt per Cron läuft,
+# damit ein Fehlschlag nicht erst auffällt, wenn der Dienst schon lange down
+# ist. Es wird ein simpler JSON-POST-Body gesendet: {"text": "..."}. Leer
+# lassen ("") = keine Benachrichtigung (Standard).
+# Beispiel (Slack/Mattermost-kompatibler Incoming-Webhook):
+#   NOTIFY_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ"
+NOTIFY_WEBHOOK_URL=""
 ### ---------------------------------------------------------------------------
+
+# ---- Fehler-Benachrichtigung (optional) ------------------------------------
+# Läuft das Script unbeaufsichtigt per Cron (Auto-Update), fällt ein
+# fehlgeschlagener Lauf sonst erst auf, wenn der Dienst schon länger down
+# ist. Bei Exit-Code != 0 und gesetztem NOTIFY_WEBHOOK_URL wird eine kurze
+# Meldung per POST an den Webhook geschickt. Absichtlich robust gegen
+# eigene Fehler (kein "set -e"-Effekt hier, "|| true" überall), damit die
+# Benachrichtigung selbst niemals den eigentlichen Exit-Code verschluckt.
+notify_on_failure() {
+  local exit_code=$?
+  if [[ "${exit_code}" -ne 0 && -n "${NOTIFY_WEBHOOK_URL}" ]]; then
+    local host
+    host="$(hostname 2>/dev/null || echo unknown)"
+    local msg="OxiCloud install/update auf '${host}' fehlgeschlagen (Exit-Code ${exit_code}). Log: ${LOG_FILE:-/var/log/oxicloud-install.log}"
+    curl -fsS -m 10 -X POST -H "Content-Type: application/json" \
+      -d "$(printf '{"text":"%s"}' "${msg//\"/\\\"}")" \
+      "${NOTIFY_WEBHOOK_URL}" >/dev/null 2>&1 || true
+  fi
+  return "${exit_code}"
+}
+trap notify_on_failure EXIT
 
 if [[ $EUID -ne 0 ]]; then
   echo "Bitte als root bzw. mit sudo ausführen." >&2
@@ -178,6 +239,24 @@ fi
 
 LOG_FILE="/var/log/oxicloud-install.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
+
+# ---- Log-Rotation für das Install-Log --------------------------------------
+# ${LOG_FILE} wächst bei jedem Lauf per "tee -a" unbegrenzt weiter, vor allem
+# bei regelmäßigen automatisierten Läufen (Cron). logrotate übernimmt das,
+# falls verfügbar; die Konfiguration wird bei jedem Lauf idempotent angelegt.
+if command -v logrotate &>/dev/null; then
+  cat > /etc/logrotate.d/oxicloud-install <<'EOF'
+/var/log/oxicloud-install.log {
+  weekly
+  rotate 8
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+fi
+
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo ""
 echo "===== Install-Lauf gestartet: $(date '+%Y-%m-%d %H:%M:%S') (Script-Version ${SCRIPT_VERSION}) ====="
@@ -223,6 +302,21 @@ if [[ "${ACTUAL_CPUS}" -lt "${RECOMMENDED_BUILD_CPUS}" || "${ACTUAL_RAM_GB}" -lt
 fi
 echo "======================================================================"
 echo ""
+
+# ---- Harter Abbruch bei kritisch wenig Diskspace ---------------------------
+# Bisher gab es nur die Warnung oben, der Build lief trotzdem an und scheiterte
+# dann oft erst mitten in "cargo build" (schlechtester Zeitpunkt: viel Zeit
+# investiert, Log unübersichtlich). Ein harter Schwellwert deutlich unter der
+# Empfehlung bricht stattdessen sofort und mit klarer Meldung ab.
+DISK_ABORT_THRESHOLD_GB=5
+if [[ "${ACTUAL_DISK_GB}" -lt "${DISK_ABORT_THRESHOLD_GB}" ]]; then
+  echo "FEHLER: Nur noch ca. ${ACTUAL_DISK_GB} GB frei unter ${OXICLOUD_HOME%/*}" >&2
+  echo "(kritischer Schwellwert: ${DISK_ABORT_THRESHOLD_GB} GB). Breche vor dem Build ab," >&2
+  echo "um einen mittendrin abgebrochenen 'cargo build' durch vollgelaufene Platte zu vermeiden." >&2
+  echo "Bitte zuerst Speicherplatz freigeben (z.B. alte Releases unter ${RELEASES_DIR}," >&2
+  echo "alte DB-Backups unter /etc/oxicloud/db-backups, apt-get clean) und erneut versuchen." >&2
+  exit 1
+fi
 
 # ---- Automatischer Swapfile als OOM-Schutz, falls nötig --------------------
 SWAP_FILE="/swapfile"
@@ -421,7 +515,14 @@ fi
 
 if [[ "${TARGET_REF}" == "main" ]]; then
   sudo -u "${OXICLOUD_USER}" git -C "${OXICLOUD_HOME}" checkout main
-  sudo -u "${OXICLOUD_USER}" git -C "${OXICLOUD_HOME}" pull origin main
+  # Statt "git pull origin main": passend zur Philosophie weiter oben, dass
+  # /opt/oxicloud ausschließlich vom Script verwaltet wird, hier konsequent
+  # "fetch + reset --hard" statt "pull". "pull" kann an einem divergierten
+  # main scheitern (z.B. nach einem Force-Push upstream); "reset --hard"
+  # erzwingt immer den exakten Stand von origin/main, unabhängig von der
+  # lokalen Historie.
+  sudo -u "${OXICLOUD_USER}" git -C "${OXICLOUD_HOME}" fetch origin main
+  sudo -u "${OXICLOUD_USER}" git -C "${OXICLOUD_HOME}" reset --hard origin/main
 else
   sudo -u "${OXICLOUD_USER}" git -C "${OXICLOUD_HOME}" checkout "${TARGET_REF}" \
     || { echo "Fehler: Tag/Referenz '${TARGET_REF}' existiert nicht im Repository." >&2; exit 1; }
@@ -573,6 +674,24 @@ fi
 if [[ -n "${ENV_OVERRIDE_SERVER_HOST}" ]]; then
   set_env_var "OXICLOUD_SERVER_HOST" "${ENV_OVERRIDE_SERVER_HOST}" "${CONFIG_DIR}/.env"
   echo "    OXICLOUD_SERVER_HOST gesetzt auf: ${ENV_OVERRIDE_SERVER_HOST}"
+
+  if [[ "${ENV_OVERRIDE_SERVER_HOST}" == "0.0.0.0" || "${ENV_OVERRIDE_SERVER_HOST}" == "::" ]]; then
+    echo "    HINWEIS: Dienst lauscht auf allen Interfaces (${ENV_OVERRIDE_SERVER_HOST}:${OXICLOUD_PORT})."
+    if command -v ufw &>/dev/null; then
+      if ! ufw status | grep -qE "^${OXICLOUD_PORT}(/tcp)?[[:space:]]+ALLOW"; then
+        echo "    ACHTUNG: ufw ist aktiv, aber Port ${OXICLOUD_PORT}/tcp scheint dort nicht"
+        echo "    freigegeben zu sein. Ohne separate Freigabe sollte der Port also NICHT von"
+        echo "    außen erreichbar sein - falls du das aber (z.B. übers LAN) doch willst:"
+        echo "    'ufw allow ${OXICLOUD_PORT}/tcp'. Falls du NICHT willst, dass der Port offen"
+        echo "    ins Internet zeigt, jetzt prüfen (z.B. Router-Portweiterleitung, Cloud-"
+        echo "    Security-Group), dass er wirklich nur intern erreichbar ist."
+      fi
+    else
+      echo "    Konnte 'ufw' nicht finden, um die Firewall-Regeln zu prüfen. Bitte manuell"
+      echo "    sicherstellen (z.B. über nftables/iptables oder Cloud-Security-Group), dass"
+      echo "    Port ${OXICLOUD_PORT}/tcp nicht versehentlich offen ins Internet zeigt."
+    fi
+  fi
 else
   echo "    OXICLOUD_SERVER_HOST unverändert gelassen (Standardwert aus example.env)"
 fi
@@ -586,6 +705,33 @@ fi
 
 chown root:"${OXICLOUD_USER}" "${CONFIG_DIR}/.env"
 chmod 640 "${CONFIG_DIR}/.env"
+
+echo "==> Erstelle Datenbank-Backup vor der Migration..."
+# "cargo sqlx migrate run" lief bisher bei JEDEM Lauf ohne vorheriges Backup -
+# eine schlecht getestete Migration (z.B. aus einem neuen Release) kann sonst
+# Daten unwiederbringlich zerstören. Ein Dump direkt davor macht das reversibel.
+DB_BACKUP_DIR="/etc/oxicloud/db-backups"
+DB_BACKUP_KEEP=10
+mkdir -p "${DB_BACKUP_DIR}"
+DB_BACKUP_FILE="${DB_BACKUP_DIR}/${DB_NAME}-$(date '+%Y%m%d-%H%M%S').sql.gz"
+if sudo -u postgres pg_dump "${DB_NAME}" | gzip > "${DB_BACKUP_FILE}"; then
+  chmod 600 "${DB_BACKUP_FILE}"
+  echo "    Backup angelegt: ${DB_BACKUP_FILE}"
+else
+  echo "FEHLER: Datenbank-Backup ist fehlgeschlagen, breche vor der Migration sicherheitshalber ab." >&2
+  rm -f "${DB_BACKUP_FILE}"
+  exit 1
+fi
+
+if [[ "${DB_BACKUP_KEEP}" -gt 0 ]]; then
+  BACKUP_COUNT="$(find "${DB_BACKUP_DIR}" -maxdepth 1 -type f -name "${DB_NAME}-*.sql.gz" | wc -l)"
+  if [[ "${BACKUP_COUNT}" -gt "${DB_BACKUP_KEEP}" ]]; then
+    echo "    Bereinige alte DB-Backups (behalte die neuesten ${DB_BACKUP_KEEP})..."
+    find "${DB_BACKUP_DIR}" -maxdepth 1 -type f -name "${DB_NAME}-*.sql.gz" -printf '%T@ %p\n' \
+      | sort -rn | tail -n +"$((DB_BACKUP_KEEP + 1))" | cut -d' ' -f2- \
+      | while IFS= read -r old_backup; do rm -f "${old_backup}"; done
+  fi
+fi
 
 echo "==> Führe ausstehende Datenbank-Migrationen aus (sqlx migrate run)..."
 sudo -u "${OXICLOUD_USER}" bash -c "
@@ -702,6 +848,54 @@ if [[ "${NEED_BUILD}" -eq 1 ]]; then
 else
   systemctl enable --now oxicloud
   echo "    Dienst läuft bereits / wurde gestartet, kein Neustart nötig."
+fi
+
+# ---- Health-Check + automatisches Rollback ---------------------------------
+# Ihr versioniert Releases zwar sauber unter releases/ mit "current"-Symlink,
+# aber bislang wird das nie genutzt: crasht der Dienst nach einem Rebuild
+# (kaputte Migration, Laufzeitfehler, fehlende Datei), blieb "current" bisher
+# einfach auf dem defekten Release stehen. Nur relevant, wenn gerade neu
+# gebaut/gestartet wurde UND es überhaupt ein vorheriges Release gibt, auf
+# das zurückgerollt werden könnte.
+if [[ "${NEED_BUILD}" -eq 1 && "${OLD_REV}" != "none" ]]; then
+  echo "==> Prüfe, ob der Dienst nach dem Neustart tatsächlich läuft und antwortet..."
+  HEALTH_RETRIES=10
+  HEALTH_OK=0
+  for i in $(seq 1 "${HEALTH_RETRIES}"); do
+    sleep 2
+    if systemctl is-active --quiet oxicloud && \
+       curl -fsS "http://127.0.0.1:${OXICLOUD_PORT}/" >/dev/null 2>&1; then
+      HEALTH_OK=1
+      break
+    fi
+  done
+
+  if [[ "${HEALTH_OK}" -eq 1 ]]; then
+    echo "    Health-Check erfolgreich, Dienst antwortet auf Port ${OXICLOUD_PORT}."
+  else
+    echo "FEHLER: Dienst antwortet nach ${HEALTH_RETRIES} Versuchen (je 2s) nicht auf Port ${OXICLOUD_PORT}." >&2
+    echo "    Prüfe: journalctl -u oxicloud -n 50 --no-pager" >&2
+    journalctl -u oxicloud -n 50 --no-pager >&2 || true
+
+    PREV_BIN="$(find "${RELEASES_DIR}" -maxdepth 1 -type f -name 'oxicloud-*' \
+      ! -name "oxicloud-${GIT_HASH_SHORT}" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+
+    if [[ -n "${PREV_BIN}" ]]; then
+      echo "    Rolle automatisch zurück auf vorheriges Release: ${PREV_BIN}" >&2
+      ln -sfn "${PREV_BIN}" "${CURRENT_LINK}"
+      systemctl restart oxicloud
+      sleep 3
+      if systemctl is-active --quiet oxicloud; then
+        echo "    Rollback erfolgreich, Dienst läuft wieder mit ${PREV_BIN}." >&2
+      else
+        echo "    ACHTUNG: Auch das vorherige Release startet nicht sauber. Manueller Eingriff nötig!" >&2
+      fi
+    else
+      echo "    Kein vorheriges Release zum Zurückrollen gefunden. Manueller Eingriff nötig!" >&2
+    fi
+    ROLLBACK_TRIGGERED=1
+    exit 1
+  fi
 fi
 
 echo ""
