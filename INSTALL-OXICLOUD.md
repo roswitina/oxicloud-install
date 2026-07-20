@@ -54,14 +54,24 @@ relevant bei `.env`, die pro Lauf potenziell **zweimal** gesichert wird
 danach vor dem Setzen von `DATABASE_URL` etc.).
 
 Jetzt bereinigt `backup_file()` nach jedem Aufruf automatisch auf die
-neuesten `GENERIC_BACKUP_KEEP` Stände **pro Datei** (Standard `10`,
-hartkodiert direkt über der Funktion, nicht im Konfigurationsblock —
-analog zu `DISK_ABORT_THRESHOLD_GB`/`DB_BACKUP_KEEP`). Zusätzlich gibt es
-jetzt einen Kollisionsschutz: Fallen zwei Backups derselben Datei in
-dieselbe Sekunde (Zeitstempel hat nur Sekundenauflösung — genau der Fall
-bei den zwei `.env`-Backups pro Lauf), wird die PID an den Dateinamen
-angehängt (`.env.<timestamp>-<pid>.bak`), statt dass der zweite Aufruf den
-ersten Backup-Stand stillschweigend überschreibt.
+neuesten `GENERIC_BACKUP_KEEP` Stände **pro Datei** (Standard `10`).
+Zusätzlich gibt es jetzt einen Kollisionsschutz: Fallen zwei Backups
+derselben Datei in dieselbe Sekunde (Zeitstempel hat nur
+Sekundenauflösung — genau der Fall bei den zwei `.env`-Backups pro Lauf),
+wird die PID an den Dateinamen angehängt (`.env.<timestamp>-<pid>.bak`),
+statt dass der zweite Aufruf den ersten Backup-Stand stillschweigend
+überschreibt.
+
+### Alle Schwellwerte jetzt zentral im Konfigurationsblock
+
+Zusätzlich wurden `DISK_ABORT_THRESHOLD_GB`, `DB_BACKUP_KEEP` und
+`HEALTH_RETRIES` (alle drei aus 1.13) sowie das neue `GENERIC_BACKUP_KEEP`
+aus ihren bisherigen Positionen direkt über der jeweiligen Codestelle in
+den zentralen Konfigurationsblock am Scriptanfang verschoben. Der Grund:
+Es gibt keinen guten inhaltlichen Grund, warum diese vier anders behandelt
+werden sollten als z. B. `KEEP_RELEASES`, das von Anfang an dort stand —
+alle anpassbaren Werte sollten an einer Stelle einsehbar sein, statt
+teils verstreut im Code zu stehen.
 
 ---
 
@@ -346,20 +356,20 @@ Ausführen mit geänderten Werten dort.
 | `OXICLOUD_VERSION_PIN` | leer | Leer = folgt `main`-Branch; `"latest"` = neuestes GitHub-Release; `"vX.Y.Z"` = fester Tag |
 | `ENABLE_PLUGINS` | `false` | `true` baut mit Cargo-Feature `plugins` (WASM-Runtime via Extism) und setzt `OXICLOUD_ENABLE_PLUGINS=true` |
 | `NOTIFY_WEBHOOK_URL` *(neu in 1.13)* | leer | Leer = keine Benachrichtigung; sonst Slack-/Mattermost-kompatible Webhook-URL, die bei jedem fehlgeschlagenen Lauf (Exit-Code ≠ 0) einen POST mit `{"text": "..."}` erhält |
+| `GENERIC_BACKUP_KEEP` *(neu in 1.14)* | `10` | Wie viele Zeitstempel-Backups **pro Datei** in den jeweiligen `backups/`-Unterordnern behalten werden (`.env`, systemd-Unit, `/etc/fstab`); `0` = keine Bereinigung |
+| `DB_BACKUP_KEEP` *(neu in 1.13, seit 1.14 zentral)* | `10` | Wie viele DB-Backups unter `/etc/oxicloud/db-backups` behalten werden; `0` = keine Bereinigung |
+| `DISK_ABORT_THRESHOLD_GB` *(neu in 1.13, seit 1.14 zentral)* | `5` | Unterhalb dieser freien GB im Ressourcen-Check bricht das Script vor dem Build hart ab |
+| `HEALTH_RETRIES` *(neu in 1.13, seit 1.14 zentral)* | `10` | Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild versucht wird, bevor ein Rollback ausgelöst wird |
 
 Alle `ENV_OVERRIDE_*`-Variablen greifen nur, wenn nicht leer — leer lassen
 heißt: Standardwert aus `example.env` bleibt unangetastet.
 
-**Nicht im Konfigurationsblock, aber ebenfalls anpassbar** (hartkodiert
-direkt über der jeweiligen Codestelle, da sie eher Sicherheitsnetz als
-Nutzereinstellung sind):
-
-| Variable | Standard | Bedeutung |
-|---|---|---|
-| `DISK_ABORT_THRESHOLD_GB` | `5` | Unterhalb dieser freien GB im Ressourcen-Check bricht das Script vor dem Build hart ab |
-| `DB_BACKUP_KEEP` | `10` | Wie viele DB-Backups unter `/etc/oxicloud/db-backups` behalten werden |
-| `HEALTH_RETRIES` | `10` | Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild versucht wird, bevor ein Rollback ausgelöst wird |
-| `GENERIC_BACKUP_KEEP` *(neu in 1.14)* | `10` | Wie viele Zeitstempel-Backups **pro Datei** in den jeweiligen `backups/`-Unterordnern behalten werden (`.env`, systemd-Unit, `/etc/fstab`) |
+Seit 1.14 stehen **alle** anpassbaren Werte gesammelt im
+Konfigurationsblock am Scriptanfang — in 1.13 waren `DISK_ABORT_THRESHOLD_GB`,
+`DB_BACKUP_KEEP` und `HEALTH_RETRIES` noch direkt über ihrer jeweiligen
+Codestelle verstreut. Das war unnötig inkonsistent, da sie sich vom
+Charakter her nicht von z. B. `KEEP_RELEASES` unterscheiden (siehe
+Abschnitt „Neuerung in 1.14" unten).
 
 ---
 
