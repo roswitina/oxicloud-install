@@ -3,12 +3,34 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.14
+# Version:          1.15
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-07-20 UTC (Aufbewahrungsgrenze für generische Backups)
+# Zuletzt geändert: 2026-07-21 UTC (Health-Check-Härtung + weniger unnötige Arbeit)
 #
 # Changelog:
+#   1.15 - Vier Verbesserungen nach Review:
+#          1) Health-Check nach Rebuild wird jetzt übersprungen (mit klarer
+#             Meldung), falls ENV_OVERRIDE_SERVER_HOST auf einen Wert
+#             gesetzt ist, der NICHT 0.0.0.0/::/leer ist - z.B. eine feste
+#             Interface-IP. In dem Fall lauscht der Dienst nicht (mehr) auf
+#             127.0.0.1, der bisherige Health-Check hätte dort IMMER
+#             fehlgeschlagen und bei jedem Rebuild fälschlich ein Rollback
+#             ausgelöst, obwohl der Dienst einwandfrei läuft.
+#          2) Health-Check läuft jetzt auch beim ALLERERSTEN Lauf (vorher
+#             nur ab dem zweiten, weil da noch kein Rollback-Ziel existiert).
+#             Schlägt er beim Erstlauf fehl, gibt es zwar kein Release zum
+#             Zurückrollen, aber wenigstens eine deutliche Fehlermeldung
+#             statt der bisherigen stillen Erfolgsmeldung trotz kaputtem
+#             Dienst.
+#          3) Tote Variable ROLLBACK_TRIGGERED entfernt (wurde gesetzt, aber
+#             nie gelesen) - stattdessen fließt ein tatsächlich erfolgtes
+#             Rollback jetzt in die Webhook-Fehlermeldung mit ein.
+#          4) chown -R auf ${OXICLOUD_HOME} lief bisher bei JEDEM Lauf
+#             bedingungslos, auch wenn ohnehin schon alles korrekt gehörte -
+#             unnötig teuer bei großen Verzeichnissen (releases/, target/,
+#             node_modules/). Jetzt wird zuerst geprüft, ob überhaupt etwas
+#             falsch gehört, chown läuft nur noch wenn nötig.
 #   1.14 - backup_file() (nutzt für .env, systemd-Unit, /etc/fstab) bereinigt
 #          jetzt alte Zeitstempel-Backups (GENERIC_BACKUP_KEEP, Standard 10),
 #          analog zu DB_BACKUP_KEEP/KEEP_RELEASES. Vorher wuchs das
@@ -155,7 +177,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben für Erstelldatum)
-SCRIPT_VERSION="1.14"
+SCRIPT_VERSION="1.15"
 
 # Versionierte Binaries: nach jedem Build wird die Binary nach ihrem
 # Git-Commit-Hash benannt und unter releases/ abgelegt. "current" ist ein
@@ -235,12 +257,20 @@ HEALTH_RETRIES=10
 # Meldung per POST an den Webhook geschickt. Absichtlich robust gegen
 # eigene Fehler (kein "set -e"-Effekt hier, "|| true" überall), damit die
 # Benachrichtigung selbst niemals den eigentlichen Exit-Code verschluckt.
+# Fix (1.15): ROLLBACK_STATUS wird weiter unten im Health-Check-Abschnitt
+# gesetzt, falls ein automatisches Rollback stattgefunden hat (erfolgreich
+# oder nicht) - fließt hier mit in die Webhook-Meldung ein, damit man beim
+# unbeaufsichtigten Lauf sofort sieht, WARUM der Exit-Code != 0 ist, statt
+# nur "irgendwas ist schiefgegangen".
+ROLLBACK_STATUS=""
 notify_on_failure() {
   local exit_code=$?
   if [[ "${exit_code}" -ne 0 && -n "${NOTIFY_WEBHOOK_URL}" ]]; then
     local host
     host="$(hostname 2>/dev/null || echo unknown)"
-    local msg="OxiCloud install/update auf '${host}' fehlgeschlagen (Exit-Code ${exit_code}). Log: ${LOG_FILE:-/var/log/oxicloud-install.log}"
+    local msg="OxiCloud install/update auf '${host}' fehlgeschlagen (Exit-Code ${exit_code})."
+    [[ -n "${ROLLBACK_STATUS}" ]] && msg="${msg} ${ROLLBACK_STATUS}"
+    msg="${msg} Log: ${LOG_FILE:-/var/log/oxicloud-install.log}"
     curl -fsS -m 10 -X POST -H "Content-Type: application/json" \
       -d "$(printf '{"text":"%s"}' "${msg//\"/\\\"}")" \
       "${NOTIFY_WEBHOOK_URL}" >/dev/null 2>&1 || true
@@ -505,8 +535,18 @@ echo "==> Lege Systembenutzer '${OXICLOUD_USER}' an..."
 id -u "${OXICLOUD_USER}" &>/dev/null || useradd -r -M -d "${OXICLOUD_HOME}" -s /usr/sbin/nologin "${OXICLOUD_USER}"
 
 mkdir -p "${OXICLOUD_HOME}"
-echo "==> Stelle sicher, dass ${OXICLOUD_HOME} durchgängig ${OXICLOUD_USER}:${OXICLOUD_USER} gehört..."
-chown -R "${OXICLOUD_USER}:${OXICLOUD_USER}" "${OXICLOUD_HOME}"
+# Fix (1.15): Vorher lief "chown -R" hier bei JEDEM Lauf bedingungslos - bei
+# einem gewachsenen Checkout (releases/ mit mehreren Binaries, target/,
+# node_modules/) unnötig teuer, wenn ohnehin schon alles korrekt gehört.
+# Jetzt erst prüfen (schneller "find"-Scan), ob überhaupt eine falsch
+# gehörende Datei/Verzeichnis existiert, und nur dann den rekursiven chown
+# tatsächlich ausführen.
+if [[ -n "$(find "${OXICLOUD_HOME}" \( ! -user "${OXICLOUD_USER}" -o ! -group "${OXICLOUD_USER}" \) -print -quit 2>/dev/null)" ]]; then
+  echo "==> ${OXICLOUD_HOME} enthält falsch gehörende Dateien, korrigiere auf ${OXICLOUD_USER}:${OXICLOUD_USER}..."
+  chown -R "${OXICLOUD_USER}:${OXICLOUD_USER}" "${OXICLOUD_HOME}"
+else
+  echo "==> ${OXICLOUD_HOME} gehört bereits durchgängig ${OXICLOUD_USER}:${OXICLOUD_USER}, überspringe chown."
+fi
 
 echo "==> Klone/aktualisiere OxiCloud in ${OXICLOUD_HOME}..."
 NEED_BUILD=0
@@ -903,15 +943,38 @@ fi
 # aber bislang wird das nie genutzt: crasht der Dienst nach einem Rebuild
 # (kaputte Migration, Laufzeitfehler, fehlende Datei), blieb "current" bisher
 # einfach auf dem defekten Release stehen. Nur relevant, wenn gerade neu
-# gebaut/gestartet wurde UND es überhaupt ein vorheriges Release gibt, auf
-# das zurückgerollt werden könnte.
-if [[ "${NEED_BUILD}" -eq 1 && "${OLD_REV}" != "none" ]]; then
+# gebaut/gestartet wurde.
+#
+# Fix (1.15), Punkt 1: Der Check prüft fest gegen "http://127.0.0.1:PORT/".
+# Ist ENV_OVERRIDE_SERVER_HOST auf eine FESTE, NICHT-lokale Interface-IP
+# gesetzt (z.B. "192.168.1.50", also weder leer noch 0.0.0.0/::), lauscht
+# der Dienst dort und NICHT auf 127.0.0.1 - der Check würde dann JEDES Mal
+# fehlschlagen und fälschlich ein Rollback auslösen, obwohl der Dienst
+# einwandfrei läuft. In diesem Fall wird der Check daher bewusst übersprungen
+# (mit Hinweis, manuell zu prüfen), statt einen falschen Fehlalarm zu riskieren.
+HEALTH_CHECK_HOST="127.0.0.1"
+SKIP_HEALTH_CHECK=0
+if [[ -n "${ENV_OVERRIDE_SERVER_HOST}" && "${ENV_OVERRIDE_SERVER_HOST}" != "0.0.0.0" && "${ENV_OVERRIDE_SERVER_HOST}" != "::" ]]; then
+  SKIP_HEALTH_CHECK=1
+fi
+
+if [[ "${NEED_BUILD}" -eq 1 && "${SKIP_HEALTH_CHECK}" -eq 1 ]]; then
+  echo "==> Überspringe automatischen Health-Check: ENV_OVERRIDE_SERVER_HOST ist auf" 
+  echo "    '${ENV_OVERRIDE_SERVER_HOST}' gesetzt, der Dienst lauscht damit vermutlich nicht auf"
+  echo "    ${HEALTH_CHECK_HOST}. Bitte manuell prüfen: systemctl status oxicloud / journalctl -u oxicloud -f"
+elif [[ "${NEED_BUILD}" -eq 1 ]]; then
+  # Fix (1.15), Punkt 2: Vorher lief dieser Block nur ab dem ZWEITEN Lauf
+  # (OLD_REV != "none"), weil nur dann ein Rollback-Ziel existiert. Damit
+  # wurde der Dienst nach der ALLERERSTEN Installation nie geprüft - eine
+  # kaputte Erstinstallation (z.B. falsche .env) hätte trotzdem "erfolgreich
+  # installiert" gemeldet. Jetzt läuft der Check immer; nur der Rollback-Teil
+  # bleibt auf "es gibt ein vorheriges Release" beschränkt.
   echo "==> Prüfe, ob der Dienst nach dem Neustart tatsächlich läuft und antwortet..."
   HEALTH_OK=0
   for i in $(seq 1 "${HEALTH_RETRIES}"); do
     sleep 2
     if systemctl is-active --quiet oxicloud && \
-       curl -fsS "http://127.0.0.1:${OXICLOUD_PORT}/" >/dev/null 2>&1; then
+       curl -fsS "http://${HEALTH_CHECK_HOST}:${OXICLOUD_PORT}/" >/dev/null 2>&1; then
       HEALTH_OK=1
       break
     fi
@@ -924,6 +987,12 @@ if [[ "${NEED_BUILD}" -eq 1 && "${OLD_REV}" != "none" ]]; then
     echo "    Prüfe: journalctl -u oxicloud -n 50 --no-pager" >&2
     journalctl -u oxicloud -n 50 --no-pager >&2 || true
 
+    if [[ "${OLD_REV}" == "none" ]]; then
+      echo "    Erstinstallation: kein vorheriges Release zum Zurückrollen vorhanden. Manueller Eingriff nötig!" >&2
+      ROLLBACK_STATUS="Health-Check nach Erstinstallation fehlgeschlagen, kein Rollback-Ziel vorhanden."
+      exit 1
+    fi
+
     PREV_BIN="$(find "${RELEASES_DIR}" -maxdepth 1 -type f -name 'oxicloud-*' \
       ! -name "oxicloud-${GIT_HASH_SHORT}" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
 
@@ -934,13 +1003,15 @@ if [[ "${NEED_BUILD}" -eq 1 && "${OLD_REV}" != "none" ]]; then
       sleep 3
       if systemctl is-active --quiet oxicloud; then
         echo "    Rollback erfolgreich, Dienst läuft wieder mit ${PREV_BIN}." >&2
+        ROLLBACK_STATUS="Automatisches Rollback auf ${PREV_BIN} erfolgreich."
       else
         echo "    ACHTUNG: Auch das vorherige Release startet nicht sauber. Manueller Eingriff nötig!" >&2
+        ROLLBACK_STATUS="Rollback auf ${PREV_BIN} versucht, aber auch dieses Release startet nicht!"
       fi
     else
       echo "    Kein vorheriges Release zum Zurückrollen gefunden. Manueller Eingriff nötig!" >&2
+      ROLLBACK_STATUS="Health-Check fehlgeschlagen, kein vorheriges Release zum Zurückrollen gefunden."
     fi
-    ROLLBACK_TRIGGERED=1
     exit 1
   fi
 fi
