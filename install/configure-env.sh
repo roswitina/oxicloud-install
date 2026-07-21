@@ -2,10 +2,15 @@
 #
 # configure-env.sh
 #
-# Version: 1.1
+# Version: 1.2
 # Lizenz:  MIT
 #
 # Changelog:
+#   1.2 - Optionale Selbstprüfung auf neuere Script-Version (CHECK_FOR_UPDATES,
+#         analog install-oxicloud.sh 1.16), rein informativ und fehlertolerant.
+#         Ohne Cache-Datei (anders als bei den Server-Scripts), da dieses
+#         Script typischerweise selten und interaktiv von Hand aufgerufen
+#         wird, nicht per Cron/automatisiert.
 #   1.1 - Drei Härtungen, angelehnt an install-oxicloud.sh:
 #         1) Nicht-atomares Schreiben behoben: Die temporäre Datei landete
 #            bisher per "mktemp" (ohne Argument) in /tmp, danach "mv" nach
@@ -56,6 +61,25 @@
 #             Nützlich zum Testen oder für unbeaufsichtigte Läufe.
 
 set -euo pipefail
+
+# Eigene Versionsnummer dieses Scripts.
+SCRIPT_VERSION="1.2"
+
+# Selbstprüfung auf neuere Script-Version (rein informativ, kein Cache -
+# dieses Script läuft typischerweise selten/interaktiv, nicht per Cron).
+CHECK_FOR_UPDATES=true
+UPDATE_CHECK_REPO="roswitina/oxicloud-install"
+UPDATE_CHECK_BRANCH="main"
+if [ "${CHECK_FOR_UPDATES}" = "true" ] && command -v curl >/dev/null 2>&1; then
+  REMOTE_RAW_SCRIPT="$(curl -fsS -m 5 \
+    "https://raw.githubusercontent.com/${UPDATE_CHECK_REPO}/${UPDATE_CHECK_BRANCH}/configure-env.sh" 2>/dev/null || true)"
+  if [ -n "${REMOTE_RAW_SCRIPT}" ]; then
+    REMOTE_SCRIPT_VERSION="$(printf '%s\n' "${REMOTE_RAW_SCRIPT}" | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+    if [ -n "${REMOTE_SCRIPT_VERSION}" ] && [ "${REMOTE_SCRIPT_VERSION}" != "${SCRIPT_VERSION}" ]; then
+      echo "Hinweis: Auf GitHub liegt eine andere Version von configure-env.sh (lokal: ${SCRIPT_VERSION}, dort: ${REMOTE_SCRIPT_VERSION}). https://github.com/${UPDATE_CHECK_REPO}" >&2
+    fi
+  fi
+fi
 
 # ─── Argumente ─────────────────────────────────────────────────────────────
 NONINTERACTIVE=0
