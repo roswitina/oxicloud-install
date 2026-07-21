@@ -6,9 +6,9 @@ Zielserver einen Rust- oder Node-Compiler braucht.
 
 | Script | Version | Läuft wo? | Zweck |
 |---|---|---|---|
-| `build-package.sh` | 2.0 | Build-Maschine / CI | Baut Backend + Frontend, schnürt `.tar.gz` |
-| `install.sh` | 1.4 | Zielserver | Erstinstallation (User, Verzeichnisse, systemd, PostgreSQL-Check, Config-Backups) |
-| `update.sh` | 1.0 | Zielserver | Aktualisiert eine bestehende Installation, mit Rollback |
+| `build-package.sh` | 2.1 | Build-Maschine / CI | Baut Backend + Frontend, schnürt `.tar.gz` |
+| `install.sh` | 1.5 | Zielserver | Erstinstallation (User, Verzeichnisse, systemd, PostgreSQL-Check, Config-Backups) |
+| `update.sh` | 1.1 | Zielserver | Aktualisiert eine bestehende Installation, mit Rollback |
 
 Lizenz: MIT
 
@@ -26,6 +26,26 @@ den Quellcode selbst klont und kompiliert (z. B. per Cronjob mit `rustup`,
 `cargo build --release` direkt auf der Maschine, die auch OxiCloud betreibt).
 Beide Ansätze sind legitim — dieses Tooling deckt den **Prebuilt-Weg** ab.
 Wer den Build-on-Target-Weg bevorzugt, braucht dieses Tooling nicht.
+
+---
+
+## Betriebsfestigkeit (seit `build-package.sh` 2.1 / `install.sh` 1.5 / `update.sh` 1.1)
+
+Alle drei Scripts wurden auf dasselbe Robustheits-Niveau wie das
+alternative `install-oxicloud.sh` (Build-on-Target-Script) gebracht:
+
+| Feature | `build-package.sh` | `install.sh` | `update.sh` |
+|---|---|---|---|
+| Lock-Datei gegen parallele Läufe (`flock`) | ✅ (pro Output-Verzeichnis) | ✅ (`/var/run/oxicloud-install.lock`) | ✅ (`/var/run/oxicloud-update.lock`) |
+| Protokoll-Datei + `logrotate` | — (läuft i. d. R. in CI, dort übernimmt der CI-Runner das Logging) | ✅ `/var/log/oxicloud-install.log` | ✅ `/var/log/oxicloud-update.log` (bereits seit 1.0, jetzt mit Rotation) |
+| Fehler-Benachrichtigung per Webhook (`NOTIFY_WEBHOOK_URL`) | — | ✅ | ✅ (inkl. Rollback-Status im Text) |
+| Zeitstempel-Backups mit Aufbewahrungsgrenze (`GENERIC_BACKUP_KEEP`) | — | ✅ (systemd-Unit) | — (Releases haben ihre eigene `KEEP_RELEASES`-Bereinigung) |
+| Preflight-Check benötigter Tools | ✅ (`cargo`, `npm`, `tar`, `sha256sum`, `git`) | — (Paket ist vorkompiliert, kaum externe Tools nötig) | — |
+
+`NOTIFY_WEBHOOK_URL` ist bei `install.sh` und `update.sh` wie bei
+`install-oxicloud.sh` standardmäßig leer (deaktiviert) und Slack-/
+Mattermost-kompatibel (POST mit `{"text": "..."}`). Besonders relevant,
+falls diese Scripts Teil eines automatisierten CI/CD-Deployments sind.
 
 ---
 
@@ -146,7 +166,7 @@ statt das Script abbrechen zu lassen.
 | `.env`-Inhalt (Connection-String, Secrets, Base-URL) | Wird nur bei der allerersten Installation angelegt; jeder weitere Lauf lässt eine bestehende Datei komplett unangetastet |
 | Lokales DB-Passwort (`--with-local-postgres`) | Persistiert separat in `/etc/oxicloud/.db_password` (`chmod 600`); bei Vorhandensein wiederverwendet statt neu generiert |
 | Postgres-Rolle/Datenbank | Anlage erfolgt idempotent (`SELECT` vor jedem `CREATE`) — kein doppeltes Anlegen, keine Passwort-Überschreibung in Postgres selbst |
-| systemd-Unit | Vor jedem Überschreiben wird eine Zeitstempel-Kopie unter `/etc/systemd/system/backups/oxicloud.service.<timestamp>.bak` angelegt |
+| systemd-Unit | Vor jedem Überschreiben wird eine Zeitstempel-Kopie unter `/etc/systemd/system/backups/oxicloud.service.<timestamp>.bak` angelegt — seit 1.5 begrenzt auf die neuesten `GENERIC_BACKUP_KEEP` Stände (Standard 10), vorher unbegrenztes Wachstum |
 | Bereits installiertes Release | `install.sh` bricht ab, wenn die Zielversion schon unter `releases/<version>/` existiert — für neue Versionen ist `update.sh` zuständig, das `.env`, DB-Passwort und Postgres gar nicht erst anfasst |
 
 ---
@@ -165,6 +185,9 @@ sudo ./install.sh
 ```
 
 **Was passiert:**
+- Verhindert per Lock-Datei (`/var/run/oxicloud-install.lock`), dass zwei
+  Läufe gleichzeitig aktiv sind, und protokolliert zusätzlich nach
+  `/var/log/oxicloud-install.log` (mit `logrotate`, falls verfügbar)
 - Legt Systemuser/-gruppe `oxicloud` an (kein Login)
 - Installiert Binary + Static-Assets nach
   `/opt/oxicloud/releases/<version>/`
@@ -173,8 +196,13 @@ sudo ./install.sh
   bestehende `.env` nie**)
 - Legt das Datenverzeichnis `/var/lib/oxicloud/storage` an
 - Setzt restriktive Dateirechte (Details siehe Tabelle unten)
-- Installiert eine gehärtete systemd-Unit (`oxicloud.service`)
+- Installiert eine gehärtete systemd-Unit (`oxicloud.service`) — die Unit
+  referenziert `postgresql.service` nur noch, wenn `--with-local-postgres`
+  verwendet wurde (seit 1.5, vorher stand die Abhängigkeit immer drin,
+  auch bei einer entfernten/verwalteten Datenbank ohne lokalen Dienst)
 - Installiert `update.sh` fest als `/usr/local/sbin/oxicloud-update`
+- Schickt bei einem fehlgeschlagenen Lauf (Exit-Code ≠ 0) optional eine
+  Webhook-Benachrichtigung, falls `NOTIFY_WEBHOOK_URL` gesetzt ist (seit 1.5)
 
 **Danach unbedingt:**
 1. `/etc/oxicloud/.env` anpassen (DB-Connection, Base-URL, Secrets)
@@ -200,6 +228,10 @@ sudo oxicloud-update /tmp/oxicloud-new/oxicloud-v0.8.2-linux-x86_64
 ```
 
 **Was passiert:**
+0. Lock-Datei (`/var/run/oxicloud-update.lock`) verhindert zwei parallele
+   Updates; existiert bereits ein Release-Verzeichnis für die Zielversion,
+   wird seit 1.1 geprüft, ob die Binary darin tatsächlich vorhanden ist
+   (schützt vor einem Rest eines vorherigen, abgebrochenen Update-Laufs)
 1. Neues Release nach `/opt/oxicloud/releases/v0.8.2/` kopieren
    (altes Release bleibt unangetastet liegen)
 2. Dienst stoppen, `current`-Symlink auf das neue Release umschalten
@@ -208,7 +240,9 @@ sudo oxicloud-update /tmp/oxicloud-new/oxicloud-v0.8.2-linux-x86_64
 5. **Bei Erfolg:** fertig, alte Releases über `KEEP_RELEASES` (Standard: 5)
    automatisch aufräumen
 6. **Bei Fehlschlag:** automatischer Rollback — Symlink zurück auf die
-   vorherige Version, Dienst neu gestartet, Script bricht mit Fehler ab
+   vorherige Version, Dienst neu gestartet, Script bricht mit Fehler ab;
+   optional zusätzlich eine Webhook-Benachrichtigung inkl. Rollback-Status,
+   falls `NOTIFY_WEBHOOK_URL` gesetzt ist (seit 1.1)
 
 **Manuelles Rollback**, falls doch mal nötig:
 
@@ -233,7 +267,11 @@ protokolliert.
 | `/etc/systemd/system/oxicloud.service` | systemd-Unit | `root:root` | `644` |
 | `/etc/systemd/system/backups/` | Zeitstempel-Backups der systemd-Unit vor jedem Überschreiben | `root:root` | — |
 | `/usr/local/sbin/oxicloud-update` | Update-Wrapper | `root:oxicloud` | `750` |
+| `/var/log/oxicloud-install.log` | Install-Protokoll *(neu in 1.5)* | — | — |
 | `/var/log/oxicloud-update.log` | Update-Protokoll | — | — |
+| `/var/run/oxicloud-install.lock` | Lock gegen parallele `install.sh`-Läufe *(neu in 1.5)* | — | — |
+| `/var/run/oxicloud-update.lock` | Lock gegen parallele `update.sh`-Läufe *(neu in 1.1)* | — | — |
+| `/etc/logrotate.d/oxicloud-install`, `/etc/logrotate.d/oxicloud-update` | Log-Rotation für die beiden Protokolle *(neu)* | — | — |
 
 ---
 
@@ -275,8 +313,8 @@ journalctl -u oxicloud -f
 
 | Datei | Version | Wichtigste Änderung |
 |---|---|---|
-| `build-package.sh` | 2.0 | Quellcode-Pfad als Parameter statt festem Repo-Root-Aufruf |
-| `install.sh` | 1.4 | Backup der systemd-Unit vor jedem Überschreiben (Zeitstempel-Kopie) |
-| `update.sh` | 1.0 | Erstversion mit Health-Check-Rollback |
+| `build-package.sh` | 2.1 | Preflight-Tool-Check, Lock-Datei gegen parallele Läufe, Warnung bei bereits existierendem Ziel-Tarball |
+| `install.sh` | 1.5 | Lock-Datei, Install-Log mit Rotation, Webhook-Benachrichtigung, Backup-Aufbewahrungsgrenze, `postgresql.service`-Abhängigkeit nur noch bei `--with-local-postgres` |
+| `update.sh` | 1.1 | Lock-Datei, Log-Rotation, Webhook-Benachrichtigung inkl. Rollback-Status, Integritätsprüfung bei wiederverwendetem Release-Verzeichnis |
 
 Lizenz: **MIT**
