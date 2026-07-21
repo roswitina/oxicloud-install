@@ -2,8 +2,27 @@
 #
 # install.sh
 #
-# Version: 1.4
+# Version: 1.5
 # Lizenz:  MIT
+#
+# Changelog:
+#   1.5 - Angeglichen an das Robustheits-Niveau von install-oxicloud.sh:
+#         1) Lock-Datei (flock) verhindert zwei parallele Läufe.
+#         2) Alle Ausgaben werden zusätzlich nach /var/log/oxicloud-install.log
+#            protokolliert (mit logrotate-Konfiguration, falls verfügbar).
+#         3) Optionale Fehler-Benachrichtigung per Webhook (NOTIFY_WEBHOOK_URL),
+#            analog install-oxicloud.sh - wichtig, falls dieses Script Teil
+#            eines automatisierten Deployments (CI/CD) ist.
+#         4) backup_file() (für die systemd-Unit) bereinigt jetzt alte
+#            Zeitstempel-Backups (GENERIC_BACKUP_KEEP, Standard 10) statt
+#            unbegrenzt zu wachsen.
+#         5) Die generierte systemd-Unit enthält "Wants=postgresql.service"
+#            jetzt NUR NOCH, wenn --with-local-postgres verwendet wurde. Bei
+#            einer entfernten/verwalteten Datenbank existiert lokal gar kein
+#            "postgresql.service" - der Verweis darauf war zwar harmlos
+#            (Wants= ist eine weiche Abhängigkeit), aber irreführend beim
+#            Lesen der Unit ("wieso postgresql.service, wir haben doch
+#            managed Postgres?").
 #
 # Installiert ein entpacktes OxiCloud-Release-Paket auf dem System.
 # Ab Version 2: versionierte Releases unter releases/<version>/ mit einem
@@ -43,6 +62,48 @@ for arg in "$@"; do
   esac
 done
 
+# ─── Verhindert parallele Läufe -------------------------------------------
+LOCK_FILE="/var/run/oxicloud-install.lock"
+exec 200>"${LOCK_FILE}"
+if ! flock -n 200; then
+  echo "Fehler: Ein anderer Lauf dieses Scripts ist bereits aktiv (Lock: ${LOCK_FILE})." >&2
+  exit 1
+fi
+
+# ─── Log-Datei + Rotation (analog install-oxicloud.sh) --------------------
+LOG_FILE="/var/log/oxicloud-install.log"
+mkdir -p "$(dirname "${LOG_FILE}")"
+if command -v logrotate &>/dev/null; then
+  cat > /etc/logrotate.d/oxicloud-install <<'EOF'
+/var/log/oxicloud-install.log {
+  weekly
+  rotate 8
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+fi
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo ""
+echo "===== install.sh-Lauf gestartet: $(date '+%Y-%m-%d %H:%M:%S') ====="
+
+# ─── Fehler-Benachrichtigung per Webhook (optional) ------------------------
+notify_on_failure() {
+  local exit_code=$?
+  if [[ "${exit_code}" -ne 0 && -n "${NOTIFY_WEBHOOK_URL}" ]]; then
+    local host
+    host="$(hostname 2>/dev/null || echo unknown)"
+    local msg="OxiCloud install.sh auf '${host}' fehlgeschlagen (Exit-Code ${exit_code}). Log: ${LOG_FILE}"
+    curl -fsS -m 10 -X POST -H "Content-Type: application/json" \
+      -d "$(printf '{"text":"%s"}' "${msg//\"/\\\"}")" \
+      "${NOTIFY_WEBHOOK_URL}" >/dev/null 2>&1 || true
+  fi
+  return "${exit_code}"
+}
+trap notify_on_failure EXIT
+
 # ─── Konfiguration ────────────────────────────────────────────────────────
 APP_USER="oxicloud"
 APP_GROUP="oxicloud"
@@ -55,6 +116,16 @@ STORAGE_DIR="${DATA_DIR}/storage"
 SERVICE_FILE="/etc/systemd/system/oxicloud.service"
 ENV_FILE="${CONFIG_DIR}/.env"
 KEEP_RELEASES=5   # 0 = keine Bereinigung, alle Releases dauerhaft behalten
+
+# Wie viele Zeitstempel-Backups PRO DATEI in backups/ behalten werden
+# (betrifft aktuell die systemd-Unit). 0 = keine Bereinigung.
+GENERIC_BACKUP_KEEP=10
+
+# Optionaler Webhook (Slack-/Mattermost-kompatibel), der bei einem
+# fehlgeschlagenen Lauf (Exit-Code != 0) einen POST mit {"text": "..."}
+# erhält - z.B. relevant, wenn install.sh Teil eines CI/CD-Deployments ist.
+# Leer lassen ("") = keine Benachrichtigung (Standard).
+NOTIFY_WEBHOOK_URL=""
 
 # Nur relevant bei --with-local-postgres
 PG_DB_NAME="oxicloud"
@@ -75,9 +146,24 @@ backup_file() {
     mkdir -p "${backup_dir}"
     local ts
     ts="$(date '+%Y%m%d-%H%M%S')"
-    local backup_path="${backup_dir}/$(basename "${file}").${ts}.bak"
+    local base
+    base="$(basename "${file}")"
+    local backup_path="${backup_dir}/${base}.${ts}.bak"
+    if [ -e "${backup_path}" ]; then
+      backup_path="${backup_dir}/${base}.${ts}-$$.bak"
+    fi
     cp -p "${file}" "${backup_path}"
     echo "    Backup angelegt: ${backup_path}"
+
+    if [ "${GENERIC_BACKUP_KEEP}" -gt 0 ]; then
+      local backup_count
+      backup_count="$(find "${backup_dir}" -maxdepth 1 -type f -name "${base}.*.bak" | wc -l)"
+      if [ "${backup_count}" -gt "${GENERIC_BACKUP_KEEP}" ]; then
+        find "${backup_dir}" -maxdepth 1 -type f -name "${base}.*.bak" -printf '%T@ %p\n' \
+          | sort -rn | tail -n +"$((GENERIC_BACKUP_KEEP + 1))" | cut -d' ' -f2- \
+          | while IFS= read -r old_backup; do rm -f "${old_backup}"; done
+      fi
+    fi
   fi
 }
 
@@ -289,11 +375,22 @@ chmod 750 "${DATA_DIR}"
 # ─── 6. systemd-Unit anlegen ──────────────────────────────────────────────
 echo "==> Installiere systemd-Unit ${SERVICE_FILE}"
 backup_file "${SERVICE_FILE}"
+# Fix (1.5): "Wants=postgresql.service" nur, wenn --with-local-postgres
+# verwendet wurde - sonst existiert lokal gar kein "postgresql.service"
+# (z.B. bei einer entfernten/verwalteten Datenbank). Wants= ist zwar eine
+# weiche Abhängigkeit (kein Start-Fehlschlag, falls die Unit fehlt), aber
+# der Verweis auf einen nie vorhandenen Dienst ist unnötig irreführend.
+PG_UNIT_LINES=""
+if [ "${WITH_LOCAL_POSTGRES}" -eq 1 ]; then
+  PG_UNIT_LINES="After=network.target postgresql.service
+Wants=postgresql.service"
+else
+  PG_UNIT_LINES="After=network.target"
+fi
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=OxiCloud - selbst-gehostete Cloud (Files/CalDAV/CardDAV)
-After=network.target postgresql.service
-Wants=postgresql.service
+${PG_UNIT_LINES}
 
 [Service]
 Type=simple
