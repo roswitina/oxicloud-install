@@ -2,10 +2,15 @@
 #
 # build-package.sh
 #
-# Version: 2.1
+# Version: 2.2
 # Lizenz:  MIT
 #
 # Changelog:
+#   2.2 - Optionale Selbstprüfung auf neuere Script-Version (CHECK_FOR_UPDATES,
+#         analog install-oxicloud.sh 1.16), rein informativ und fehlertolerant.
+#         Cache liegt neben dem Script selbst (TOOL_DIR), nicht unter
+#         /etc/oxicloud - das Script läuft ja typischerweise NICHT auf dem
+#         OxiCloud-Zielserver, sondern auf einer separaten Build-Maschine/CI.
 #   2.1 - Angeglichen an das Robustheits-Niveau von install-oxicloud.sh:
 #         1) Preflight-Check auf benötigte Tools (cargo, npm, tar,
 #            sha256sum, git) mit klarer Fehlermeldung VOR dem Build, statt
@@ -47,8 +52,47 @@
 
 set -euo pipefail
 
+# Eigene Versionsnummer dieses Scripts (NICHT zu verwechseln mit VERSION
+# weiter unten - das ist die Version des zu bauenden OxiCloud-Pakets).
+SCRIPT_VERSION="2.2"
+
+# Selbstprüfung auf neuere Script-Version (rein informativ, siehe unten).
+CHECK_FOR_UPDATES=true
+UPDATE_CHECK_REPO="roswitina/oxicloud-install"
+UPDATE_CHECK_BRANCH="main"
+UPDATE_CHECK_INTERVAL_HOURS=24
+
 # ─── Eigener Standort (für install.sh/update.sh, unabhängig vom cwd) ──────
 TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+UPDATE_CHECK_CACHE="${TOOL_DIR}/.update-check-cache"
+
+# ─── Selbstprüfung auf neuere Script-Version (rein informativ) ────────────
+if [ "${CHECK_FOR_UPDATES}" = "true" ] && command -v curl >/dev/null 2>&1; then
+  DO_UPDATE_CHECK=1
+  if [ -f "${UPDATE_CHECK_CACHE}" ]; then
+    LAST_CHECK_EPOCH="$(cat "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo 0)"
+    NOW_EPOCH="$(date +%s)"
+    AGE_HOURS=$(( (NOW_EPOCH - LAST_CHECK_EPOCH) / 3600 ))
+    [ "${AGE_HOURS}" -lt "${UPDATE_CHECK_INTERVAL_HOURS}" ] && DO_UPDATE_CHECK=0
+  fi
+
+  if [ "${DO_UPDATE_CHECK}" -eq 1 ]; then
+    REMOTE_RAW_SCRIPT="$(curl -fsS -m 5 \
+      "https://raw.githubusercontent.com/${UPDATE_CHECK_REPO}/${UPDATE_CHECK_BRANCH}/build-package.sh" 2>/dev/null || true)"
+    if [ -n "${REMOTE_RAW_SCRIPT}" ]; then
+      REMOTE_SCRIPT_VERSION="$(printf '%s\n' "${REMOTE_RAW_SCRIPT}" | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+      if [ -n "${REMOTE_SCRIPT_VERSION}" ] && [ "${REMOTE_SCRIPT_VERSION}" != "${SCRIPT_VERSION}" ]; then
+        echo ""
+        echo "Hinweis: Auf GitHub liegt eine andere Version von build-package.sh"
+        echo "         (lokal: ${SCRIPT_VERSION}, dort auf '${UPDATE_CHECK_BRANCH}': ${REMOTE_SCRIPT_VERSION})."
+        echo "         https://github.com/${UPDATE_CHECK_REPO}"
+        echo ""
+      fi
+    fi
+    date +%s > "${UPDATE_CHECK_CACHE}" 2>/dev/null || true
+  fi
+fi
 
 # ─── Argumente ─────────────────────────────────────────────────────────────
 if [ $# -lt 1 ]; then
