@@ -3,12 +3,20 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.15
+# Version:          1.16
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-07-21 UTC (Health-Check-Härtung + weniger unnötige Arbeit)
+# Zuletzt geändert: 2026-07-21 UTC (optionaler Update-Check gegen GitHub)
 #
 # Changelog:
+#   1.16 - Optionale Selbstprüfung auf neuere Script-Version (CHECK_FOR_UPDATES,
+#          Standard true): vergleicht die Versionsnummer im main-Branch von
+#          https://github.com/roswitina/oxicloud-install mit der lokal
+#          laufenden SCRIPT_VERSION und gibt ggf. einen Hinweis aus - rein
+#          informativ, lädt/ersetzt nichts automatisch. Fehlertolerant
+#          (kein Abbruch bei fehlendem Internet/curl), auf höchstens einen
+#          echten Check pro UPDATE_CHECK_INTERVAL_HOURS (Standard 24)
+#          begrenzt, per CHECK_FOR_UPDATES=false komplett abschaltbar.
 #   1.15 - Vier Verbesserungen nach Review:
 #          1) Health-Check nach Rebuild wird jetzt übersprungen (mit klarer
 #             Meldung), falls ENV_OVERRIDE_SERVER_HOST auf einen Wert
@@ -177,7 +185,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben für Erstelldatum)
-SCRIPT_VERSION="1.15"
+SCRIPT_VERSION="1.16"
 
 # Versionierte Binaries: nach jedem Build wird die Binary nach ihrem
 # Git-Commit-Hash benannt und unter releases/ abgelegt. "current" ist ein
@@ -248,6 +256,18 @@ DISK_ABORT_THRESHOLD_GB=5
 # versucht wird, bevor automatisch auf das vorherige Release zurückgerollt
 # wird (siehe Health-Check-Abschnitt weiter unten).
 HEALTH_RETRIES=10
+
+# Prüft bei jedem Lauf (höchstens alle UPDATE_CHECK_INTERVAL_HOURS Stunden,
+# siehe Cache-Datei), ob im GitHub-Repo eine andere Script-Version dieses
+# Scripts liegt als die lokal laufende - reine Information, KEIN
+# automatisches Update. Fehlertolerant: schlägt der Check fehl (kein
+# Internet, GitHub nicht erreichbar, kein curl), wird das Script dadurch
+# nie aufgehalten oder abgebrochen. false = Check komplett deaktiviert.
+CHECK_FOR_UPDATES=true
+UPDATE_CHECK_REPO="roswitina/oxicloud-install"
+UPDATE_CHECK_BRANCH="main"
+UPDATE_CHECK_INTERVAL_HOURS=24
+UPDATE_CHECK_CACHE="/etc/oxicloud/.update-check-install-oxicloud"
 ### ---------------------------------------------------------------------------
 
 # ---- Fehler-Benachrichtigung (optional) ------------------------------------
@@ -442,6 +462,40 @@ if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
   apt-get install -y "${MISSING_PACKAGES[@]}"
 else
   echo "    Alle benötigten Basis-Pakete sind bereits installiert."
+fi
+
+# ---- Selbstprüfung auf neuere Script-Version (rein informativ) ------------
+# Vergleicht nur die Versionsnummer im Header des main-Branchs auf GitHub
+# mit SCRIPT_VERSION hier - lädt NICHTS herunter oder ersetzt sich selbst.
+# Läuft frühestens hier, weil curl an dieser Stelle durch den Preflight-Check
+# garantiert vorhanden ist. Wird höchstens alle UPDATE_CHECK_INTERVAL_HOURS
+# Stunden tatsächlich ausgeführt (Cache-Datei), um GitHub nicht bei jedem
+# (ggf. minütlichen Cron-)Lauf unnötig zu belasten.
+if [[ "${CHECK_FOR_UPDATES}" == "true" ]] && command -v curl &>/dev/null; then
+  DO_UPDATE_CHECK=1
+  if [[ -f "${UPDATE_CHECK_CACHE}" ]]; then
+    LAST_CHECK_EPOCH="$(cat "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo 0)"
+    NOW_EPOCH="$(date +%s)"
+    AGE_HOURS=$(( (NOW_EPOCH - LAST_CHECK_EPOCH) / 3600 ))
+    [[ "${AGE_HOURS}" -lt "${UPDATE_CHECK_INTERVAL_HOURS}" ]] && DO_UPDATE_CHECK=0
+  fi
+
+  if [[ "${DO_UPDATE_CHECK}" -eq 1 ]]; then
+    REMOTE_RAW_SCRIPT="$(curl -fsS -m 5 \
+      "https://raw.githubusercontent.com/${UPDATE_CHECK_REPO}/${UPDATE_CHECK_BRANCH}/install-oxicloud.sh" 2>/dev/null)" || true
+    if [[ -n "${REMOTE_RAW_SCRIPT}" ]]; then
+      REMOTE_SCRIPT_VERSION="$(printf '%s\n' "${REMOTE_RAW_SCRIPT}" | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+      if [[ -n "${REMOTE_SCRIPT_VERSION}" && "${REMOTE_SCRIPT_VERSION}" != "${SCRIPT_VERSION}" ]]; then
+        echo ""
+        echo "Hinweis: Auf GitHub liegt eine andere Version von install-oxicloud.sh"
+        echo "         (lokal: ${SCRIPT_VERSION}, dort auf '${UPDATE_CHECK_BRANCH}': ${REMOTE_SCRIPT_VERSION})."
+        echo "         https://github.com/${UPDATE_CHECK_REPO}"
+        echo ""
+      fi
+    fi
+    mkdir -p "$(dirname "${UPDATE_CHECK_CACHE}")" 2>/dev/null || true
+    date +%s > "${UPDATE_CHECK_CACHE}" 2>/dev/null || true
+  fi
 fi
 
 if [[ -n "${NODE_VERSION_PIN}" ]]; then
