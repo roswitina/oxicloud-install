@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.15
+Version: 1.16
 Lizenz: MIT
 
 ---
@@ -22,6 +22,7 @@ Lizenz: MIT
 | 1.13 | Sieben Robustheits-Verbesserungen, siehe Abschnitt „Neuerungen in 1.13" unten: automatisches Health-Check-Rollback, DB-Backup vor jeder Migration, Log-Rotation fürs Install-Log, `git fetch`+`reset --hard` statt `pull`, harter Abbruch bei kritisch wenig Diskspace, Firewall-Hinweis bei `0.0.0.0`/`::`, optionale Fehler-Benachrichtigung per Webhook |
 | 1.14 | Aufbewahrungsgrenze für die generischen Zeitstempel-Backups (`.env`, systemd-Unit, `/etc/fstab`), siehe Abschnitt „Neuerung in 1.14" unten: `backup_file()` bereinigte bisher nie, wuchs also unbegrenzt — besonders relevant, da `.env` pro Lauf potenziell zweimal gesichert wird |
 | 1.15 | Vier Verbesserungen nach Review, siehe Abschnitt „Neuerungen in 1.15" unten: Health-Check wird bei fester, nicht-lokaler `ENV_OVERRIDE_SERVER_HOST` übersprungen statt fälschlich Rollback auszulösen; Health-Check läuft jetzt auch bei der Erstinstallation; tote Variable entfernt, Rollback-Status fließt stattdessen in die Webhook-Meldung ein; `chown -R` auf `${OXICLOUD_HOME}` läuft nur noch, wenn tatsächlich etwas falsch gehört |
+| 1.16 | Optionale Selbstprüfung auf neuere Script-Version gegen GitHub (`CHECK_FOR_UPDATES`), siehe Abschnitt „Neuerung in 1.16" unten: rein informativer Hinweis, kein automatisches Update, fehlertolerant, höchstens 1x/Tag ausgeführt |
 
 ---
 
@@ -38,6 +39,42 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerung in 1.16
+
+### Selbstprüfung auf neuere Script-Version (GitHub)
+
+Bei jedem Lauf (nachdem `curl` durch den Preflight-Check garantiert
+vorhanden ist) prüft das Script, ob im `main`-Branch von
+[roswitina/oxicloud-install](https://github.com/roswitina/oxicloud-install)
+eine andere `SCRIPT_VERSION` steht als lokal gerade läuft:
+
+```
+Hinweis: Auf GitHub liegt eine andere Version von install-oxicloud.sh
+         (lokal: 1.16, dort auf 'main': 1.17).
+         https://github.com/roswitina/oxicloud-install
+```
+
+Wichtig, was das **nicht** tut:
+- **Kein automatisches Update.** Es wird nichts heruntergeladen, ersetzt
+  oder ausgeführt — nur die Versionsnummer im Header des Remote-Scripts
+  wird per `curl` abgerufen und verglichen. Ein Script, das sich selbst
+  überschreibt, wäre ein unnötiges Einfallstor (Supply-Chain-Risiko, falls
+  Repo oder Verbindung kompromittiert sind).
+- **Kein Abbruch bei Fehlschlag.** Kein Internet, GitHub nicht erreichbar,
+  Rate-Limit, kein `curl` vorhanden — in jedem Fall wird der Check still
+  übersprungen (`|| true`, 5s Timeout), der eigentliche Install-/Update-Lauf
+  läuft unbeeinflusst weiter.
+- **Kein Spam bei häufigen/automatisierten Läufen.** Der tatsächliche
+  GitHub-Abruf erfolgt höchstens alle `UPDATE_CHECK_INTERVAL_HOURS`
+  (Standard 24) - der Zeitpunkt des letzten Checks wird in
+  `/etc/oxicloud/.update-check-install-oxicloud` gecacht.
+
+Per `CHECK_FOR_UPDATES=false` komplett abschaltbar (z. B. auf Servern ohne
+Internetzugang zu GitHub); `UPDATE_CHECK_REPO`/`UPDATE_CHECK_BRANCH` sind
+konfigurierbar, falls ihr das Tooling forkt.
 
 ---
 
@@ -411,6 +448,10 @@ Ausführen mit geänderten Werten dort.
 | `DB_BACKUP_KEEP` *(neu in 1.13, seit 1.14 zentral)* | `10` | Wie viele DB-Backups unter `/etc/oxicloud/db-backups` behalten werden; `0` = keine Bereinigung |
 | `DISK_ABORT_THRESHOLD_GB` *(neu in 1.13, seit 1.14 zentral)* | `5` | Unterhalb dieser freien GB im Ressourcen-Check bricht das Script vor dem Build hart ab |
 | `HEALTH_RETRIES` *(neu in 1.13, seit 1.14 zentral)* | `10` | Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild versucht wird, bevor ein Rollback ausgelöst wird |
+| `CHECK_FOR_UPDATES` *(neu in 1.16)* | `true` | Prüft bei jedem Lauf (gecacht, siehe `UPDATE_CHECK_INTERVAL_HOURS`), ob im GitHub-Repo eine andere Script-Version liegt — rein informativ, `false` deaktiviert den Check komplett |
+| `UPDATE_CHECK_REPO` *(neu in 1.16)* | `roswitina/oxicloud-install` | GitHub-Repo (`owner/repo`), gegen das die Versionsprüfung läuft |
+| `UPDATE_CHECK_BRANCH` *(neu in 1.16)* | `main` | Branch, aus dem die Referenzversion gelesen wird |
+| `UPDATE_CHECK_INTERVAL_HOURS` *(neu in 1.16)* | `24` | Mindestabstand zwischen zwei tatsächlichen GitHub-Abrufen (Cache-Datei) |
 
 Alle `ENV_OVERRIDE_*`-Variablen greifen nur, wenn nicht leer — leer lassen
 heißt: Standardwert aus `example.env` bleibt unangetastet.
