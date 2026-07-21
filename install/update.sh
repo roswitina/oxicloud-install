@@ -2,8 +2,24 @@
 #
 # update.sh
 #
-# Version: 1.0
+# Version: 1.1
 # Lizenz:  MIT
+#
+# Changelog:
+#   1.1 - Angeglichen an das Robustheits-Niveau von install-oxicloud.sh:
+#         1) Lock-Datei (flock) verhindert zwei parallele Updates.
+#         2) logrotate-Konfiguration für /var/log/oxicloud-update.log
+#            (falls logrotate verfügbar ist), damit das Log bei
+#            wiederholten Updates nicht unbegrenzt wächst.
+#         3) Optionale Fehler-Benachrichtigung per Webhook
+#            (NOTIFY_WEBHOOK_URL), inkl. Hinweis ob ein Rollback erfolgte.
+#         4) Wird ein bereits vorhandenes Release-Verzeichnis wiederverwendet
+#            (${NEW_RELEASE_DIR} existiert schon), prüft das Script jetzt,
+#            ob die Binary darin tatsächlich vorhanden ist - vorher hätte
+#            ein Release-Verzeichnis aus einem vorherigen ABGEBROCHENEN
+#            Lauf (z.B. Absturz mitten im "cp") stillschweigend als
+#            vollständig gegolten und das Umschalten wäre mit einer
+#            fehlenden/kaputten Binary fehlgeschlagen.
 #
 # Aktualisiert eine bereits per install.sh installierte OxiCloud-Instanz auf
 # ein neues Release, ohne Konfiguration (.env, systemd-Unit) anzufassen.
@@ -42,11 +58,57 @@ HEALTH_PATH="/health"
 HEALTH_RETRIES=15
 HEALTH_INTERVAL=2
 
+# Optionaler Webhook (Slack-/Mattermost-kompatibel), der bei einem
+# fehlgeschlagenen Lauf (Exit-Code != 0) einen POST mit {"text": "..."}
+# erhält. Leer lassen ("") = keine Benachrichtigung (Standard).
+NOTIFY_WEBHOOK_URL=""
+
+# ─── Verhindert parallele Updates ------------------------------------------
+LOCK_FILE="/var/run/oxicloud-update.lock"
+exec 200>"${LOCK_FILE}"
+if ! flock -n 200; then
+  echo "Fehler: Ein anderer Update-Lauf ist bereits aktiv (Lock: ${LOCK_FILE})." >&2
+  exit 1
+fi
+
 LOG_FILE="/var/log/oxicloud-update.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
+
+# ─── Log-Rotation für das Update-Log ---------------------------------------
+if command -v logrotate &>/dev/null; then
+  cat > /etc/logrotate.d/oxicloud-update <<'EOF'
+/var/log/oxicloud-update.log {
+  weekly
+  rotate 8
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+fi
+
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo ""
 echo "===== Update-Lauf gestartet: $(date '+%Y-%m-%d %H:%M:%S') ====="
+
+# ─── Fehler-Benachrichtigung per Webhook (optional) ------------------------
+UPDATE_ROLLBACK_STATUS=""
+notify_on_failure() {
+  local exit_code=$?
+  if [[ "${exit_code}" -ne 0 && -n "${NOTIFY_WEBHOOK_URL}" ]]; then
+    local host
+    host="$(hostname 2>/dev/null || echo unknown)"
+    local msg="OxiCloud update.sh auf '${host}' fehlgeschlagen (Exit-Code ${exit_code})."
+    [[ -n "${UPDATE_ROLLBACK_STATUS}" ]] && msg="${msg} ${UPDATE_ROLLBACK_STATUS}"
+    msg="${msg} Log: ${LOG_FILE}"
+    curl -fsS -m 10 -X POST -H "Content-Type: application/json" \
+      -d "$(printf '{"text":"%s"}' "${msg//\"/\\\"}")" \
+      "${NOTIFY_WEBHOOK_URL}" >/dev/null 2>&1 || true
+  fi
+  return "${exit_code}"
+}
+trap notify_on_failure EXIT
 
 # ─── Vorprüfungen ─────────────────────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
@@ -85,9 +147,18 @@ if [ "${NEW_VERSION}" = "${PREVIOUS_VERSION}" ]; then
   exit 0
 fi
 
-if [ -e "${NEW_RELEASE_DIR}" ]; then
-  echo "Release ${NEW_VERSION} liegt bereits unter ${NEW_RELEASE_DIR} - wird erneut verwendet."
+if [ -e "${NEW_RELEASE_DIR}" ] && [ -x "${NEW_RELEASE_DIR}/bin/oxicloud" ]; then
+  echo "Release ${NEW_VERSION} liegt bereits vollständig unter ${NEW_RELEASE_DIR} - wird erneut verwendet."
 else
+  if [ -e "${NEW_RELEASE_DIR}" ]; then
+    # Fix (1.1): Verzeichnis existiert, aber die Binary fehlt/ist nicht
+    # ausführbar - vermutlich Rest eines vorherigen, mittendrin abgebrochenen
+    # Update-Laufs (z.B. Absturz während "cp"). Statt das fälschlich als
+    # vollständig zu behandeln und erst beim Umschalten zu scheitern, wird
+    # der Rest hier verworfen und sauber neu kopiert.
+    echo "==> Unvollständiges Release-Verzeichnis ${NEW_RELEASE_DIR} gefunden (Binary fehlt), räume auf und kopiere neu..." >&2
+    rm -rf "${NEW_RELEASE_DIR}"
+  fi
   # ─── 1. Neues Release installieren (alter bleibt unangetastet) ──────────
   echo "==> Kopiere neues Release nach ${NEW_RELEASE_DIR}"
   mkdir -p "${NEW_RELEASE_DIR}/bin" "${NEW_RELEASE_DIR}/static"
@@ -125,6 +196,7 @@ rollback() {
   ln -sfn "${PREVIOUS_RELEASE_DIR}" "${CURRENT_LINK}"
   systemctl start "${SERVICE_NAME}" || true
   echo "Rollback durchgeführt. current zeigt wieder auf ${PREVIOUS_VERSION}." >&2
+  UPDATE_ROLLBACK_STATUS="Health-Check für ${NEW_VERSION} fehlgeschlagen, automatisches Rollback auf ${PREVIOUS_VERSION} durchgeführt."
   exit 1
 }
 
