@@ -2,8 +2,19 @@
 #
 # build-package.sh
 #
-# Version: 2.0
+# Version: 2.1
 # Lizenz:  MIT
+#
+# Changelog:
+#   2.1 - Angeglichen an das Robustheits-Niveau von install-oxicloud.sh:
+#         1) Preflight-Check auf benötigte Tools (cargo, npm, tar,
+#            sha256sum, git) mit klarer Fehlermeldung VOR dem Build, statt
+#            eines kryptischen "command not found" mitten im Build.
+#         2) Lock-Datei (flock) pro Output-Verzeichnis verhindert, dass
+#            zwei parallele Läufe (z.B. zwei CI-Jobs) sich gegenseitig ins
+#            selbe Staging-Verzeichnis schreiben.
+#         3) Warnung, falls das Ziel-Tarball (gleiche Version+Arch) bereits
+#            existiert und gleich überschrieben wird - vorher stillschweigend.
 #
 # Baut OxiCloud (Backend + Frontend) aus einem beliebigen Checkout und
 # schnürt daraus ein selbst-enthaltenes tar.gz-Release-Paket:
@@ -60,6 +71,30 @@ for f in install.sh update.sh; do
   fi
 done
 
+# ─── Preflight: benötigte Tools prüfen ─────────────────────────────────────
+# Ohne diesen Check würde ein fehlendes Tool erst mitten im Build (z.B. nach
+# mehreren Minuten "cargo build") mit einem kryptischen "command not found"
+# auffallen. Lieber sofort und mit klarer Meldung abbrechen.
+REQUIRED_TOOLS=(cargo npm tar sha256sum git)
+MISSING_TOOLS=()
+for tool in "${REQUIRED_TOOLS[@]}"; do
+  command -v "${tool}" &>/dev/null || MISSING_TOOLS+=("${tool}")
+done
+if [ "${#MISSING_TOOLS[@]}" -gt 0 ]; then
+  echo "Fehler: Folgende benötigte Tools fehlen auf dieser Build-Maschine: ${MISSING_TOOLS[*]}" >&2
+  echo "Bitte nachinstallieren (Rust via rustup, Node.js via NodeSource o.ä.) und erneut versuchen." >&2
+  exit 1
+fi
+
+# ─── Verhindert parallele Läufe ins selbe Output-Verzeichnis ───────────────
+mkdir -p "${OUTPUT_DIR}"
+LOCK_FILE="${OUTPUT_DIR}/.build-package.lock"
+exec 201>"${LOCK_FILE}"
+if ! flock -n 201; then
+  echo "Fehler: Ein anderer build-package.sh-Lauf für ${OUTPUT_DIR} ist bereits aktiv." >&2
+  exit 1
+fi
+
 VERSION="${2:-$(cd "${SOURCE_DIR}" && git describe --tags --always 2>/dev/null || echo dev)}"
 ARCH="$(uname -m)"
 DIST_NAME="oxicloud-${VERSION}-linux-${ARCH}"
@@ -70,6 +105,12 @@ echo "Tooling:    ${TOOL_DIR}"
 echo "Version:    ${VERSION}"
 echo "Ausgabe:    ${STAGE}.tar.gz"
 echo ""
+
+if [ -e "${OUTPUT_DIR}/${DIST_NAME}.tar.gz" ]; then
+  echo "Hinweis: ${OUTPUT_DIR}/${DIST_NAME}.tar.gz existiert bereits und wird" >&2
+  echo "am Ende überschrieben (gleiche Version '${VERSION}' + Architektur '${ARCH}')." >&2
+  echo ""
+fi
 
 echo "==> Baue Backend (release)"
 ( cd "${SOURCE_DIR}" && cargo build --release )
