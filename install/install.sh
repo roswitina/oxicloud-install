@@ -2,10 +2,14 @@
 #
 # install.sh
 #
-# Version: 1.5
+# Version: 1.6
 # Lizenz:  MIT
 #
 # Changelog:
+#   1.6 - Optionale Selbstprüfung auf neuere Script-Version (CHECK_FOR_UPDATES,
+#         analog install-oxicloud.sh 1.16): vergleicht gegen den main-Branch
+#         von https://github.com/roswitina/oxicloud-install, rein informativ,
+#         fehlertolerant, höchstens 1x pro UPDATE_CHECK_INTERVAL_HOURS (24).
 #   1.5 - Angeglichen an das Robustheits-Niveau von install-oxicloud.sh:
 #         1) Lock-Datei (flock) verhindert zwei parallele Läufe.
 #         2) Alle Ausgaben werden zusätzlich nach /var/log/oxicloud-install.log
@@ -105,6 +109,10 @@ notify_on_failure() {
 trap notify_on_failure EXIT
 
 # ─── Konfiguration ────────────────────────────────────────────────────────
+# Eigene Versionsnummer dieses Scripts (NICHT zu verwechseln mit VERSION
+# weiter unten - das ist die Version des zu installierenden OxiCloud-Pakets).
+SCRIPT_VERSION="1.6"
+
 APP_USER="oxicloud"
 APP_GROUP="oxicloud"
 INSTALL_DIR="/opt/oxicloud"
@@ -126,6 +134,13 @@ GENERIC_BACKUP_KEEP=10
 # erhält - z.B. relevant, wenn install.sh Teil eines CI/CD-Deployments ist.
 # Leer lassen ("") = keine Benachrichtigung (Standard).
 NOTIFY_WEBHOOK_URL=""
+
+# Selbstprüfung auf neuere Script-Version (rein informativ, siehe unten).
+CHECK_FOR_UPDATES=true
+UPDATE_CHECK_REPO="roswitina/oxicloud-install"
+UPDATE_CHECK_BRANCH="main"
+UPDATE_CHECK_INTERVAL_HOURS=24
+UPDATE_CHECK_CACHE="/etc/oxicloud/.update-check-install"
 
 # Nur relevant bei --with-local-postgres
 PG_DB_NAME="oxicloud"
@@ -171,6 +186,38 @@ backup_file() {
 if [ "$(id -u)" -ne 0 ]; then
   echo "Bitte als root ausführen (z.B. mit sudo)." >&2
   exit 1
+fi
+
+# ─── Selbstprüfung auf neuere Script-Version (rein informativ) ────────────
+# Vergleicht nur die Versionsnummer im main-Branch von GitHub mit
+# SCRIPT_VERSION hier - lädt/ersetzt nichts automatisch. Fehlertolerant
+# (kein curl vorhanden oder GitHub nicht erreichbar -> einfach übersprungen),
+# höchstens 1x pro UPDATE_CHECK_INTERVAL_HOURS tatsächlich ausgeführt.
+if [ "${CHECK_FOR_UPDATES}" = "true" ] && command -v curl >/dev/null 2>&1; then
+  DO_UPDATE_CHECK=1
+  if [ -f "${UPDATE_CHECK_CACHE}" ]; then
+    LAST_CHECK_EPOCH="$(cat "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo 0)"
+    NOW_EPOCH="$(date +%s)"
+    AGE_HOURS=$(( (NOW_EPOCH - LAST_CHECK_EPOCH) / 3600 ))
+    [ "${AGE_HOURS}" -lt "${UPDATE_CHECK_INTERVAL_HOURS}" ] && DO_UPDATE_CHECK=0
+  fi
+
+  if [ "${DO_UPDATE_CHECK}" -eq 1 ]; then
+    REMOTE_RAW_SCRIPT="$(curl -fsS -m 5 \
+      "https://raw.githubusercontent.com/${UPDATE_CHECK_REPO}/${UPDATE_CHECK_BRANCH}/install.sh" 2>/dev/null || true)"
+    if [ -n "${REMOTE_RAW_SCRIPT}" ]; then
+      REMOTE_SCRIPT_VERSION="$(printf '%s\n' "${REMOTE_RAW_SCRIPT}" | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+      if [ -n "${REMOTE_SCRIPT_VERSION}" ] && [ "${REMOTE_SCRIPT_VERSION}" != "${SCRIPT_VERSION}" ]; then
+        echo ""
+        echo "Hinweis: Auf GitHub liegt eine andere Version von install.sh"
+        echo "         (lokal: ${SCRIPT_VERSION}, dort auf '${UPDATE_CHECK_BRANCH}': ${REMOTE_SCRIPT_VERSION})."
+        echo "         https://github.com/${UPDATE_CHECK_REPO}"
+        echo ""
+      fi
+    fi
+    mkdir -p "$(dirname "${UPDATE_CHECK_CACHE}")" 2>/dev/null || true
+    date +%s > "${UPDATE_CHECK_CACHE}" 2>/dev/null || true
+  fi
 fi
 
 for f in "bin/oxicloud" "static" "example.env" "update.sh"; do
