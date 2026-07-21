@@ -4,8 +4,34 @@ Interaktives Script, das aus einer `example.env` (Vorlage) und optional
 einer bestehenden `.env` eine neue `.env` erzeugt — Variable für Variable
 zum Behalten, Aktivieren, Deaktivieren oder Ändern.
 
-Version: 1.0
+Version: 1.1
 Lizenz: MIT
+
+---
+
+## Änderungen in 1.1
+
+Drei Härtungen, angelehnt an das Robustheits-Niveau von `install-oxicloud.sh`:
+
+1. **Atomares Schreiben behoben:** Die temporäre Datei landete vorher per
+   `mktemp` (ohne Argument) im systemweiten `/tmp`, bevor sie per `mv` an
+   den eigentlichen Zielort verschoben wurde. Liegen `/tmp` und das
+   Zielverzeichnis (z. B. `/etc/oxicloud`) auf unterschiedlichen
+   Dateisystemen — üblich, z. B. `/tmp` als `tmpfs` — macht `mv` daraus
+   intern ein `cp` + `rm`, was **nicht atomar** ist: ein Absturz oder
+   Stromausfall mittendrin hätte eine leere oder halb geschriebene `.env`
+   hinterlassen können. Die Temp-Datei wird jetzt im selben Verzeichnis wie
+   die Zieldatei angelegt, wodurch `mv` zu einem echten (atomaren)
+   `rename()` wird.
+2. **Aufbewahrungsgrenze für Zeitstempel-Backups:** `backup_file()`
+   bereinigt jetzt wie in `install-oxicloud.sh` alte Backups automatisch
+   auf die neuesten `GENERIC_BACKUP_KEEP` Stände (Standard 10) pro Datei,
+   inklusive Kollisionsschutz bei zwei Backups derselben Datei in
+   derselben Sekunde.
+3. **Ownership beim Schreiben:** Die Ausgabedatei wird zusätzlich zu
+   `chmod 640` auf `root:oxicloud` gesetzt (best-effort, schlägt still
+   fehl, falls nicht als root ausgeführt oder die Gruppe nicht existiert —
+   das Script bleibt damit auch außerhalb von OxiCloud-Systemen nutzbar).
 
 ---
 
@@ -137,7 +163,9 @@ OXICLOUD_ENABLE_PLUGINS  [bestehende .env]
   sondern als `#KEY=WERT` mitgeschrieben, damit du sie später ohne erneute
   Eingabe wieder aktivieren kannst.
 - **Bestehende Zieldatei**: Wird vor dem Überschreiben per Zeitstempel
-  gesichert, nicht einfach ersetzt.
+  gesichert, nicht einfach ersetzt — seit 1.1 begrenzt auf die neuesten
+  `GENERIC_BACKUP_KEEP` Stände (Standard 10), damit `backups/` nicht
+  unbegrenzt wächst.
 
 ---
 
