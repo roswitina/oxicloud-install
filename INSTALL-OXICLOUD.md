@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.14
+Version: 1.15
 Lizenz: MIT
 
 ---
@@ -21,6 +21,7 @@ Lizenz: MIT
 | 1.12 | Fix nach fehlgeschlagenem Testlauf in einem LXC-Container, siehe Abschnitt „Fix in 1.12" unten: `sudo` fehlte in der Preflight-Paketliste und war auf einem minimalen LXC-Template nicht vorinstalliert — Script brach beim ersten `sudo -u ...`-Aufruf mit `command not found` ab |
 | 1.13 | Sieben Robustheits-Verbesserungen, siehe Abschnitt „Neuerungen in 1.13" unten: automatisches Health-Check-Rollback, DB-Backup vor jeder Migration, Log-Rotation fürs Install-Log, `git fetch`+`reset --hard` statt `pull`, harter Abbruch bei kritisch wenig Diskspace, Firewall-Hinweis bei `0.0.0.0`/`::`, optionale Fehler-Benachrichtigung per Webhook |
 | 1.14 | Aufbewahrungsgrenze für die generischen Zeitstempel-Backups (`.env`, systemd-Unit, `/etc/fstab`), siehe Abschnitt „Neuerung in 1.14" unten: `backup_file()` bereinigte bisher nie, wuchs also unbegrenzt — besonders relevant, da `.env` pro Lauf potenziell zweimal gesichert wird |
+| 1.15 | Vier Verbesserungen nach Review, siehe Abschnitt „Neuerungen in 1.15" unten: Health-Check wird bei fester, nicht-lokaler `ENV_OVERRIDE_SERVER_HOST` übersprungen statt fälschlich Rollback auszulösen; Health-Check läuft jetzt auch bei der Erstinstallation; tote Variable entfernt, Rollback-Status fließt stattdessen in die Webhook-Meldung ein; `chown -R` auf `${OXICLOUD_HOME}` läuft nur noch, wenn tatsächlich etwas falsch gehört |
 
 ---
 
@@ -37,6 +38,56 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerungen in 1.15
+
+Vier Verbesserungen nach einem weiteren Review — alle betreffen Fälle, in
+denen das Script vorher entweder unnötig viel Arbeit machte oder sich in
+Randfällen falsch verhalten hätte.
+
+### 1. Health-Check wird bei fester, nicht-lokaler `ENV_OVERRIDE_SERVER_HOST` übersprungen
+
+Der Health-Check prüft fest gegen `http://127.0.0.1:${OXICLOUD_PORT}/`. Für
+`0.0.0.0`/`::` (Dienst lauscht auf allen Interfaces, `127.0.0.1` also
+eingeschlossen) ist das kein Problem. Wird `ENV_OVERRIDE_SERVER_HOST` aber
+auf eine **feste, andere** Adresse gesetzt (z. B. `"192.168.1.50"`),
+lauscht der Dienst dort und nicht mehr auf `127.0.0.1` — der Check wäre
+dann bei **jedem** Rebuild fälschlich fehlgeschlagen und hätte ein
+unnötiges Rollback ausgelöst, obwohl der Dienst einwandfrei läuft. Das
+Script überspringt den Check jetzt in diesem Fall bewusst, mit dem
+Hinweis, den Dienst manuell zu prüfen (`systemctl status oxicloud`).
+
+### 2. Health-Check läuft jetzt auch bei der Erstinstallation
+
+Vorher lief der komplette Health-Check-Abschnitt nur ab dem **zweiten**
+Lauf, weil nur dann ein Rollback-Ziel existiert. Damit wurde eine kaputte
+**Erstinstallation** (z. B. fehlerhafte `.env`) nie geprüft — das Script
+meldete am Ende trotzdem unkommentiert "erfolgreich installiert". Jetzt
+läuft der Check immer; nur der eigentliche Rollback-Schritt bleibt
+naturgemäß auf den Fall beschränkt, dass es ein vorheriges Release gibt.
+Schlägt der Check bei der Erstinstallation fehl, bricht das Script mit
+einer klaren Fehlermeldung ab, statt fälschlich Erfolg zu melden.
+
+### 3. Rollback-Status fließt in die Webhook-Meldung ein
+
+Die interne Variable, die bisher nur "es gab ein Rollback" markierte, ohne
+je gelesen zu werden, wurde entfernt. Stattdessen trägt ein aussagekräftiger
+Text (z. B. "Automatisches Rollback auf .../oxicloud-<hash> erfolgreich.")
+jetzt direkt in die `NOTIFY_WEBHOOK_URL`-Meldung ein — bei einem
+unbeaufsichtigten Cron-Lauf seht ihr damit sofort im Chat/Webhook, *warum*
+der Lauf fehlgeschlagen ist, statt nur eines generischen Exit-Codes.
+
+### 4. `chown -R` läuft nur noch, wenn tatsächlich nötig
+
+Der rekursive `chown` auf `${OXICLOUD_HOME}` (Selbstheilung, siehe
+Grundidee) lief bisher bei **jedem** Lauf bedingungslos — bei einem
+gewachsenen Checkout mit `releases/` (mehrere Binaries), `target/`
+(Rust-Build-Cache) und `node_modules/` unnötig langsam, wenn ohnehin
+schon alles korrekt gehört. Ein schneller Scan prüft jetzt vorab, ob
+überhaupt eine falsch gehörende Datei existiert; der eigentliche
+`chown -R` läuft nur noch in diesem Fall.
 
 ---
 
@@ -419,13 +470,17 @@ Abschnitt „Neuerung in 1.14" unten).
    abgelegt; der Symlink `current` zeigt danach darauf.
 8. **systemd**: Unit wird (neu) geschrieben (weiterhin ohne `DATABASE_URL`
    im Klartext, siehe oben), Dienst bei Bedarf neu gestartet.
-9. **Health-Check + automatisches Rollback** *(neu in 1.13)*: Nur falls
-   gerade neu gebaut/gestartet wurde. Antwortet der Dienst nicht
-   fristgerecht, wird automatisch auf das vorherige Release
-   zurückgerollt (siehe „Neuerungen in 1.13", Punkt 1). Bei jedem
-   Fehlschlag des gesamten Laufs (Exit-Code ≠ 0) wird, falls
-   `NOTIFY_WEBHOOK_URL` gesetzt ist, zusätzlich eine Benachrichtigung
-   verschickt (siehe Punkt 7 dort).
+9. **Health-Check + automatisches Rollback** *(neu in 1.13, seit 1.15 auch
+   bei der Erstinstallation aktiv)*: Läuft immer, wenn gerade neu
+   gebaut/gestartet wurde — außer `ENV_OVERRIDE_SERVER_HOST` ist auf eine
+   feste, nicht-lokale Adresse gesetzt, dann wird bewusst übersprungen
+   (siehe „Neuerungen in 1.15", Punkt 1). Antwortet der Dienst nicht
+   fristgerecht, wird automatisch auf das vorherige Release zurückgerollt,
+   sofern eines existiert (siehe „Neuerungen in 1.13", Punkt 1, und
+   „Neuerungen in 1.15", Punkt 2). Bei jedem Fehlschlag des gesamten Laufs
+   (Exit-Code ≠ 0) wird, falls `NOTIFY_WEBHOOK_URL` gesetzt ist, zusätzlich
+   eine Benachrichtigung verschickt, seit 1.15 inklusive Rollback-Status
+   im Text (siehe „Neuerungen in 1.15", Punkt 3).
 
 ---
 
@@ -559,6 +614,14 @@ mitausgegebenen letzten 50 Zeilen aus `journalctl -u oxicloud` prüfen,
 bzw. erneut per `journalctl -u oxicloud -n 100 --no-pager` nachsehen.
 Erst nach Behebung der Ursache erneut versuchen; bis dahin läuft der
 Dienst stabil mit dem zurückgerollten, vorherigen Release weiter.
+
+**„Überspringe automatischen Health-Check: ENV_OVERRIDE_SERVER_HOST ist auf ... gesetzt" (neu in 1.15):**
+Kein Fehler: `ENV_OVERRIDE_SERVER_HOST` ist auf eine feste, nicht-lokale
+Adresse gesetzt (nicht leer, nicht `0.0.0.0`/`::`), der Dienst lauscht dort
+also nicht auf `127.0.0.1`. Der Check würde in diesem Fall immer
+fälschlich fehlschlagen, deshalb wird er bewusst übersprungen. Bitte
+manuell prüfen: `systemctl status oxicloud` und ggf. `curl` direkt gegen
+die konfigurierte Adresse.
 
 **„ACHTUNG: Auch das vorherige Release startet nicht sauber. Manueller Eingriff nötig!" (neu in 1.13):**
 Sowohl das neue als auch das automatisch zurückgerollte vorherige Release
