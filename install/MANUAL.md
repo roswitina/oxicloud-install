@@ -6,9 +6,9 @@ Zielserver einen Rust- oder Node-Compiler braucht.
 
 | Script | Version | Läuft wo? | Zweck |
 |---|---|---|---|
-| `build-package.sh` | 2.1 | Build-Maschine / CI | Baut Backend + Frontend, schnürt `.tar.gz` |
-| `install.sh` | 1.5 | Zielserver | Erstinstallation (User, Verzeichnisse, systemd, PostgreSQL-Check, Config-Backups) |
-| `update.sh` | 1.1 | Zielserver | Aktualisiert eine bestehende Installation, mit Rollback |
+| `build-package.sh` | 2.2 | Build-Maschine / CI | Baut Backend + Frontend, schnürt `.tar.gz` |
+| `install.sh` | 1.6 | Zielserver | Erstinstallation (User, Verzeichnisse, systemd, PostgreSQL-Check, Config-Backups) |
+| `update.sh` | 1.2 | Zielserver | Aktualisiert eine bestehende Installation, mit Rollback |
 
 Lizenz: MIT
 
@@ -29,7 +29,7 @@ Wer den Build-on-Target-Weg bevorzugt, braucht dieses Tooling nicht.
 
 ---
 
-## Betriebsfestigkeit (seit `build-package.sh` 2.1 / `install.sh` 1.5 / `update.sh` 1.1)
+## Betriebsfestigkeit (seit `build-package.sh` 2.2 / `install.sh` 1.6 / `update.sh` 1.2)
 
 Alle drei Scripts wurden auf dasselbe Robustheits-Niveau wie das
 alternative `install-oxicloud.sh` (Build-on-Target-Script) gebracht:
@@ -41,6 +41,17 @@ alternative `install-oxicloud.sh` (Build-on-Target-Script) gebracht:
 | Fehler-Benachrichtigung per Webhook (`NOTIFY_WEBHOOK_URL`) | — | ✅ | ✅ (inkl. Rollback-Status im Text) |
 | Zeitstempel-Backups mit Aufbewahrungsgrenze (`GENERIC_BACKUP_KEEP`) | — | ✅ (systemd-Unit) | — (Releases haben ihre eigene `KEEP_RELEASES`-Bereinigung) |
 | Preflight-Check benötigter Tools | ✅ (`cargo`, `npm`, `tar`, `sha256sum`, `git`) | — (Paket ist vorkompiliert, kaum externe Tools nötig) | — |
+| Selbstprüfung auf neuere Script-Version (`CHECK_FOR_UPDATES`) | ✅ | ✅ | ✅ |
+
+Die Selbstprüfung auf eine neuere Script-Version vergleicht nur die
+Versionsnummer im `main`-Branch von
+[roswitina/oxicloud-install](https://github.com/roswitina/oxicloud-install)
+mit der lokal laufenden — **rein informativ**, es wird nichts automatisch
+heruntergeladen oder ersetzt. Fehlertolerant (kein Internet/GitHub
+nicht erreichbar → einfach übersprungen) und auf max. 1 echten Abruf pro
+`UPDATE_CHECK_INTERVAL_HOURS` (Standard 24) begrenzt; bei `configure-env.sh`
+ohne Cache, da dieses Script typischerweise nur selten/interaktiv läuft.
+Per `CHECK_FOR_UPDATES=false` in jedem der vier Scripts abschaltbar.
 
 `NOTIFY_WEBHOOK_URL` ist bei `install.sh` und `update.sh` wie bei
 `install-oxicloud.sh` standardmäßig leer (deaktiviert) und Slack-/
@@ -313,8 +324,8 @@ journalctl -u oxicloud -f
 
 | Datei | Version | Wichtigste Änderung |
 |---|---|---|
-| `build-package.sh` | 2.1 | Preflight-Tool-Check, Lock-Datei gegen parallele Läufe, Warnung bei bereits existierendem Ziel-Tarball |
-| `install.sh` | 1.5 | Lock-Datei, Install-Log mit Rotation, Webhook-Benachrichtigung, Backup-Aufbewahrungsgrenze, `postgresql.service`-Abhängigkeit nur noch bei `--with-local-postgres` |
-| `update.sh` | 1.1 | Lock-Datei, Log-Rotation, Webhook-Benachrichtigung inkl. Rollback-Status, Integritätsprüfung bei wiederverwendetem Release-Verzeichnis |
+| `build-package.sh` | 2.2 | Selbstprüfung auf neuere Script-Version gegen GitHub (rein informativ) |
+| `install.sh` | 1.6 | Selbstprüfung auf neuere Script-Version gegen GitHub (rein informativ) |
+| `update.sh` | 1.2 | Selbstprüfung auf neuere Script-Version gegen GitHub (rein informativ) |
 
 Lizenz: **MIT**
