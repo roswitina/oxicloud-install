@@ -2,8 +2,27 @@
 #
 # configure-env.sh
 #
-# Version: 1.0
+# Version: 1.1
 # Lizenz:  MIT
+#
+# Changelog:
+#   1.1 - Drei Härtungen, angelehnt an install-oxicloud.sh:
+#         1) Nicht-atomares Schreiben behoben: Die temporäre Datei landete
+#            bisher per "mktemp" (ohne Argument) in /tmp, danach "mv" nach
+#            z.B. /etc/oxicloud/.env. Liegen /tmp und das Zielverzeichnis auf
+#            unterschiedlichen Dateisystemen (sehr üblich, z.B. tmpfs vs.
+#            root-fs), macht "mv" daraus intern ein cp+rm - NICHT atomar. Ein
+#            Absturz/Stromausfall mittendrin hätte eine leere oder halb
+#            geschriebene .env hinterlassen können. Jetzt wird die Temp-Datei
+#            im selben Verzeichnis wie die Zieldatei angelegt, wodurch "mv"
+#            ein reines (atomares) rename() ist.
+#         2) backup_file() bereinigt jetzt alte Zeitstempel-Backups analog zu
+#            GENERIC_BACKUP_KEEP in install-oxicloud.sh (Standard 10) - vorher
+#            wuchs backups/ bei wiederholten Läufen unbegrenzt.
+#         3) Ausgabedatei wird, sofern schreibbar, zusätzlich auf
+#            root:<gruppe der Zieldatei bzw. "oxicloud"> gesetzt, nicht nur
+#            chmod 640 - vorher blieb z.B. nach einer Neuanlage die Gruppe
+#            ggf. auf der ausführenden Shell stehen statt auf "oxicloud".
 #
 # Liest eine example.env (Vorlage) und optional eine bereits bestehende
 # .env, geht interaktiv jede Variable durch (behalten / aktivieren /
@@ -66,7 +85,11 @@ if [ -n "${EXISTING_FILE}" ] && [ ! -f "${EXISTING_FILE}" ]; then
   EXISTING_FILE=""
 fi
 
-# ─── Backup-Helfer (wie in install.sh) ─────────────────────────────────────
+# Wie viele Zeitstempel-Backups PRO DATEI in backups/ behalten werden.
+# 0 = keine Bereinigung, alle Backups werden dauerhaft behalten.
+GENERIC_BACKUP_KEEP=10
+
+# ─── Backup-Helfer (wie in install-oxicloud.sh) ────────────────────────────
 backup_file() {
   local file="$1"
   if [ -f "${file}" ]; then
@@ -75,9 +98,26 @@ backup_file() {
     mkdir -p "${backup_dir}" 2>/dev/null || backup_dir="."
     local ts
     ts="$(date '+%Y%m%d-%H%M%S')"
-    local backup_path="${backup_dir}/$(basename "${file}").${ts}.bak"
+    local base
+    base="$(basename "${file}")"
+    local backup_path="${backup_dir}/${base}.${ts}.bak"
+    # Kollisionsschutz analog install-oxicloud.sh: Sekundenauflösung des
+    # Zeitstempels reicht bei zwei schnell aufeinanderfolgenden Läufen nicht.
+    if [ -e "${backup_path}" ]; then
+      backup_path="${backup_dir}/${base}.${ts}-$$.bak"
+    fi
     cp -p "${file}" "${backup_path}"
     echo "Backup angelegt: ${backup_path}"
+
+    if [ "${GENERIC_BACKUP_KEEP}" -gt 0 ]; then
+      local backup_count
+      backup_count="$(find "${backup_dir}" -maxdepth 1 -type f -name "${base}.*.bak" 2>/dev/null | wc -l)"
+      if [ "${backup_count}" -gt "${GENERIC_BACKUP_KEEP}" ]; then
+        find "${backup_dir}" -maxdepth 1 -type f -name "${base}.*.bak" -printf '%T@ %p\n' 2>/dev/null \
+          | sort -rn | tail -n +"$((GENERIC_BACKUP_KEEP + 1))" | cut -d' ' -f2- \
+          | while IFS= read -r old_backup; do rm -f "${old_backup}"; done
+      fi
+    fi
   fi
 }
 
@@ -279,7 +319,14 @@ if [ -f "${OUTPUT_FILE}" ]; then
   backup_file "${OUTPUT_FILE}"
 fi
 
-TMP_FILE="$(mktemp)"
+# Fix (1.1): TMP_FILE MUSS im selben Verzeichnis wie OUTPUT_FILE liegen,
+# nicht im systemweiten /tmp (Standard-Verhalten von "mktemp" ohne Argument).
+# Liegen Temp- und Zielverzeichnis auf unterschiedlichen Dateisystemen, macht
+# "mv" daraus intern ein cp+rm statt eines echten (atomaren) rename() - ein
+# Absturz mittendrin könnte dann eine leere/kaputte .env hinterlassen.
+OUTPUT_DIR_FOR_TMP="$(dirname "${OUTPUT_FILE}")"
+mkdir -p "${OUTPUT_DIR_FOR_TMP}" 2>/dev/null || true
+TMP_FILE="$(mktemp "${OUTPUT_DIR_FOR_TMP}/.configure-env.XXXXXX" 2>/dev/null || mktemp)"
 {
   echo "# Erzeugt von configure-env.sh am $(date '+%Y-%m-%d %H:%M:%S')"
   echo "# Basis: ${EXAMPLE_FILE}$( [ -n "${EXISTING_FILE}" ] && echo " + ${EXISTING_FILE}" )"
@@ -322,5 +369,12 @@ TMP_FILE="$(mktemp)"
 
 mv "${TMP_FILE}" "${OUTPUT_FILE}"
 chmod 640 "${OUTPUT_FILE}" 2>/dev/null || true
+# Fix (1.1): Ownership explizit setzen, nicht nur Rechte - sonst kann die
+# Gruppe nach einer Neuanlage z.B. auf der ausführenden Shell/dem User
+# stehen bleiben statt auf "oxicloud" (relevant, falls z.B. root diese
+# Datei für den Dienst-User anlegt). Best-effort: schlägt still fehl, falls
+# nicht als root ausgeführt oder die Gruppe "oxicloud" nicht existiert -
+# das Script bleibt damit auch außerhalb von OxiCloud-Systemen nutzbar.
+chown root:oxicloud "${OUTPUT_FILE}" 2>/dev/null || true
 
 echo "Fertig geschrieben: ${OUTPUT_FILE}"
