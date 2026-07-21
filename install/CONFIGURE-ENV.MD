@@ -4,8 +4,22 @@ Interaktives Script, das aus einer `example.env` (Vorlage) und optional
 einer bestehenden `.env` eine neue `.env` erzeugt — Variable für Variable
 zum Behalten, Aktivieren, Deaktivieren oder Ändern.
 
-Version: 1.1
+Version: 1.2
 Lizenz: MIT
+
+---
+
+## Änderungen in 1.2
+
+Optionale Selbstprüfung auf neuere Script-Version: vergleicht bei jedem
+Lauf (sofern `curl` vorhanden und `CHECK_FOR_UPDATES=true`, Standard) die
+`SCRIPT_VERSION` im `main`-Branch von
+[roswitina/oxicloud-install](https://github.com/roswitina/oxicloud-install)
+mit der lokal laufenden und gibt bei Abweichung einen Hinweis aus — rein
+informativ, kein automatisches Update, fehlertolerant. Anders als bei
+`install-oxicloud.sh`/`install.sh`/`update.sh` **ohne** Cache-Datei, da
+dieses Script typischerweise selten und interaktiv von Hand aufgerufen
+wird statt per Cron.
 
 ---
 
