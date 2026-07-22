@@ -3,12 +3,26 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.16
+# Version:          1.17
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-07-21 UTC (optionaler Update-Check gegen GitHub)
+# Zuletzt geändert: 2026-07-22 UTC (Selbstheilung bei Cargo.lock-Konflikt)
 #
 # Changelog:
+#   1.17 - Selbstheilung, falls "cargo build --release --locked" fehlschlägt,
+#          weil die eingecheckte Cargo.lock nicht mehr zur Cargo.toml passt
+#          (z.B. weil Upstream im main-Branch eine Abhängigkeit geändert/
+#          hinzugefügt hat, ohne die Lockfile neu zu committen). Da dieses
+#          Script standardmäßig ungepinnt dem main-Branch folgt, kann das
+#          jederzeit erneut auftreten ("cannot update the lock file ...
+#          because --locked was passed"). Der erste Build-Versuch bleibt
+#          bewusst strikt mit "--locked" (damit ein "echter" Kompilierfehler
+#          weiterhin sofort auffällt und nicht durch automatisches Neu-
+#          Lock'en verschleiert wird). Schlägt er fehl, wird NUR die Lockfile
+#          neu erzeugt (cargo generate-lockfile) und der Build danach genau
+#          einmal erneut mit --locked versucht. Schlägt auch dieser zweite
+#          Versuch fehl, liegt es an etwas anderem, und das Script bricht
+#          regulär ab (set -e).
 #   1.16 - Optionale Selbstprüfung auf neuere Script-Version (CHECK_FOR_UPDATES,
 #          Standard true): vergleicht die Versionsnummer im main-Branch von
 #          https://github.com/roswitina/oxicloud-install mit der lokal
@@ -185,7 +199,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben für Erstelldatum)
-SCRIPT_VERSION="1.16"
+SCRIPT_VERSION="1.17"
 
 # Versionierte Binaries: nach jedem Build wird die Binary nach ihrem
 # Git-Commit-Hash benannt und unter releases/ abgelegt. "current" ist ein
@@ -902,12 +916,44 @@ if [[ "${NEED_BUILD}" -eq 1 ]]; then
   "
 
   echo "==> Baue OxiCloud im Release-Modus (das kann einige Minuten dauern)..."
-  sudo -u "${OXICLOUD_USER}" bash -c "
+  # Fix (1.17): "cargo build --release --locked" bricht hart ab, wenn
+  # Cargo.toml und die eingecheckte Cargo.lock nicht mehr zusammenpassen
+  # (z.B. weil Upstream im main-Branch eine Abhängigkeit geändert/hinzugefügt
+  # hat, ohne die Lockfile neu zu committen) - "--locked" verweigert dann
+  # bewusst jede Aktualisierung der Lockfile und bricht stattdessen ab
+  # ("cannot update the lock file ... because --locked was passed"). Bei
+  # diesem Repo, das per Standard dem main-Branch ohne Pin folgt, kann das
+  # jederzeit erneut auftreten. Statt das dann jedes Mal von Hand zu
+  # reparieren: erster Build-Versuch bleibt strikt mit "--locked" (damit ein
+  # "echter" Kompilierfehler weiterhin sofort auffällt); schlägt er fehl,
+  # wird NUR die Lockfile neu erzeugt (kein --offline nötig, aber auch kein
+  # --locked, also genau der vom Fehler vorgeschlagene Weg) und der Build
+  # danach genau einmal erneut mit --locked versucht. Schlägt auch dieser
+  # zweite Versuch fehl, liegt es an etwas anderem als der Lockfile, und das
+  # Script bricht regulär mit "set -e" ab.
+  if ! sudo -u "${OXICLOUD_USER}" bash -c "
     source '${RUSTUP_ENV}'
     cd '${OXICLOUD_HOME}'
     export DATABASE_URL='${DATABASE_URL}'
     cargo build --release --locked ${BUILD_FEATURES}
-  "
+  "; then
+    echo "    'cargo build --locked' ist fehlgeschlagen - vermutlich passt die"
+    echo "    eingecheckte Cargo.lock nicht mehr zur Cargo.toml (Upstream hat sie"
+    echo "    beim letzten Commit nicht mit aktualisiert). Erzeuge die Lockfile"
+    echo "    neu und versuche den Build genau einmal erneut..."
+    sudo -u "${OXICLOUD_USER}" bash -c "
+      source '${RUSTUP_ENV}'
+      cd '${OXICLOUD_HOME}'
+      cargo generate-lockfile
+    "
+    echo "    Lockfile neu erzeugt, wiederhole den Release-Build mit --locked..."
+    sudo -u "${OXICLOUD_USER}" bash -c "
+      source '${RUSTUP_ENV}'
+      cd '${OXICLOUD_HOME}'
+      export DATABASE_URL='${DATABASE_URL}'
+      cargo build --release --locked ${BUILD_FEATURES}
+    "
+  fi
 
   echo -n "${BUILD_FEATURES}" > "${FEATURES_STATE_FILE}"
 
