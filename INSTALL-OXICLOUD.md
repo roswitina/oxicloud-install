@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.16
+Version: 1.17
 Lizenz: MIT
 
 ---
@@ -23,6 +23,7 @@ Lizenz: MIT
 | 1.14 | Aufbewahrungsgrenze für die generischen Zeitstempel-Backups (`.env`, systemd-Unit, `/etc/fstab`), siehe Abschnitt „Neuerung in 1.14" unten: `backup_file()` bereinigte bisher nie, wuchs also unbegrenzt — besonders relevant, da `.env` pro Lauf potenziell zweimal gesichert wird |
 | 1.15 | Vier Verbesserungen nach Review, siehe Abschnitt „Neuerungen in 1.15" unten: Health-Check wird bei fester, nicht-lokaler `ENV_OVERRIDE_SERVER_HOST` übersprungen statt fälschlich Rollback auszulösen; Health-Check läuft jetzt auch bei der Erstinstallation; tote Variable entfernt, Rollback-Status fließt stattdessen in die Webhook-Meldung ein; `chown -R` auf `${OXICLOUD_HOME}` läuft nur noch, wenn tatsächlich etwas falsch gehört |
 | 1.16 | Optionale Selbstprüfung auf neuere Script-Version gegen GitHub (`CHECK_FOR_UPDATES`), siehe Abschnitt „Neuerung in 1.16" unten: rein informativer Hinweis, kein automatisches Update, fehlertolerant, höchstens 1x/Tag ausgeführt |
+| 1.17 | Selbstheilung bei fehlschlagendem `cargo build --release --locked`, siehe Abschnitt „Neuerung in 1.17" unten: passt die eingecheckte `Cargo.lock` (z. B. nach einem Upstream-Commit ohne aktualisierte Lockfile) nicht mehr zur `Cargo.toml`, wird sie einmalig neu erzeugt und der Build genau einmal wiederholt |
 
 ---
 
@@ -39,6 +40,42 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerung in 1.17
+
+### Selbstheilung bei fehlschlagendem `cargo build --release --locked`
+
+Da dieses Script standardmäßig ungepinnt dem `main`-Branch von OxiCloud
+folgt, kann es passieren, dass Upstream im main-Branch eine Abhängigkeit
+in `Cargo.toml` ändert oder hinzufügt, ohne die eingecheckte `Cargo.lock`
+mit zu aktualisieren. `cargo build --release --locked` verweigert dann
+bewusst jede Aktualisierung der Lockfile und bricht stattdessen ab:
+
+```
+error: cannot update the lock file ... because --locked was passed
+```
+
+Vorher musste das jedes Mal von Hand behoben werden
+(`cargo generate-lockfile` + Build erneut anstoßen). Das Script macht das
+jetzt selbst:
+
+1. Erster Build-Versuch bleibt bewusst strikt mit `--locked` — ein
+   „echter" Kompilierfehler (z. B. kaputter Code, fehlende Systemlib) soll
+   weiterhin sofort auffallen und nicht durch automatisches Neu-Lock'en
+   verschleiert werden.
+2. Schlägt nur dieser Versuch fehl, wird **nur** die Lockfile neu erzeugt
+   (`cargo generate-lockfile`, ohne `--offline` — braucht kurz Netzwerk)
+   und der Release-Build danach **genau einmal** erneut mit `--locked`
+   versucht.
+3. Schlägt auch dieser zweite Versuch fehl, liegt es an etwas anderem als
+   der Lockfile — das Script bricht dann regulär ab (`set -e`), inklusive
+   der üblichen Fehler-Benachrichtigung per Webhook, falls konfiguriert.
+
+Kein Verhaltensunterschied, wenn der erste `--locked`-Versuch ohnehin
+erfolgreich ist (der Normalfall) — die Zwei-Versuche-Logik greift nur im
+Fehlerfall.
 
 ---
 
@@ -630,6 +667,16 @@ Preflight-Check `sudo` automatisch mit, falls es fehlt (siehe „Fix in
 1.12" oben). Bei einer älteren Script-Version: `apt-get install -y sudo`
 manuell ausführen und das Script erneut starten — dank Idempotenz setzt es
 sauber dort fort, wo es abgebrochen war.
+
+**`error: cannot update the lock file ... because --locked was passed` (behoben seit 1.17):**
+Die eingecheckte `Cargo.lock` passt nicht mehr zur `Cargo.toml` — meist,
+weil Upstream im main-Branch eine Abhängigkeit geändert/hinzugefügt hat,
+ohne die Lockfile neu zu committen. Seit Version 1.17 fängt das Script
+das selbst ab: erzeugt bei diesem Fehler einmalig eine neue Lockfile
+(`cargo generate-lockfile`) und wiederholt den Build genau einmal (siehe
+„Neuerung in 1.17" oben). Bei einer älteren Script-Version manuell:
+`cd /opt/oxicloud && sudo -u oxicloud bash -c "source .cargo/env && cargo generate-lockfile"`,
+danach das Script erneut ausführen.
 
 **Build bricht mit `signal: 9, SIGKILL` ab:**
 Fast immer OOM (zu wenig RAM). Das Script versucht das per Auto-Swapfile
