@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.17
+Version: 1.18
 Lizenz: MIT
 
 ---
@@ -16,14 +16,15 @@ Lizenz: MIT
 | Version | Änderung |
 |---|---|
 | 1.9 | Ursprüngliche Fassung |
-| 1.10 | `REPO_URL` konsistent auf `AtalayaLabs/OxiCloud` (inkl. GitHub-API-Aufruf in `resolve_target_ref()`); systemd-Hardening ergänzt (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths`); Kommentar zur `Requires=` vs. `Wants=`-Entscheidung bei `postgresql.service` |
-| 1.11 | Drei Fixes nach Review, siehe Abschnitt „Fixes in 1.11" unten: (1) `set -e`-Fallstrick bei der Node.js-LTS-Ermittlung, (2) DB-Passwort wird jetzt bei jedem Lauf durchgesetzt statt nur beim Erstanlegen, (3) DB-Passwort steht nicht mehr im world-readable systemd-Unit-File |
-| 1.12 | Fix nach fehlgeschlagenem Testlauf in einem LXC-Container, siehe Abschnitt „Fix in 1.12" unten: `sudo` fehlte in der Preflight-Paketliste und war auf einem minimalen LXC-Template nicht vorinstalliert — Script brach beim ersten `sudo -u ...`-Aufruf mit `command not found` ab |
-| 1.13 | Sieben Robustheits-Verbesserungen, siehe Abschnitt „Neuerungen in 1.13" unten: automatisches Health-Check-Rollback, DB-Backup vor jeder Migration, Log-Rotation fürs Install-Log, `git fetch`+`reset --hard` statt `pull`, harter Abbruch bei kritisch wenig Diskspace, Firewall-Hinweis bei `0.0.0.0`/`::`, optionale Fehler-Benachrichtigung per Webhook |
-| 1.14 | Aufbewahrungsgrenze für die generischen Zeitstempel-Backups (`.env`, systemd-Unit, `/etc/fstab`), siehe Abschnitt „Neuerung in 1.14" unten: `backup_file()` bereinigte bisher nie, wuchs also unbegrenzt — besonders relevant, da `.env` pro Lauf potenziell zweimal gesichert wird |
-| 1.15 | Vier Verbesserungen nach Review, siehe Abschnitt „Neuerungen in 1.15" unten: Health-Check wird bei fester, nicht-lokaler `ENV_OVERRIDE_SERVER_HOST` übersprungen statt fälschlich Rollback auszulösen; Health-Check läuft jetzt auch bei der Erstinstallation; tote Variable entfernt, Rollback-Status fließt stattdessen in die Webhook-Meldung ein; `chown -R` auf `${OXICLOUD_HOME}` läuft nur noch, wenn tatsächlich etwas falsch gehört |
-| 1.16 | Optionale Selbstprüfung auf neuere Script-Version gegen GitHub (`CHECK_FOR_UPDATES`), siehe Abschnitt „Neuerung in 1.16" unten: rein informativer Hinweis, kein automatisches Update, fehlertolerant, höchstens 1x/Tag ausgeführt |
-| 1.17 | Selbstheilung bei fehlschlagendem `cargo build --release --locked`, siehe Abschnitt „Neuerung in 1.17" unten: passt die eingecheckte `Cargo.lock` (z. B. nach einem Upstream-Commit ohne aktualisierte Lockfile) nicht mehr zur `Cargo.toml`, wird sie einmalig neu erzeugt und der Build genau einmal wiederholt |
+| 1.10 | `REPO_URL` konsistent auf `AtalayaLabs/OxiCloud`; systemd-Hardening ergänzt |
+| 1.11 | `set -e`-Fallstrick bei Node.js-LTS-Ermittlung behoben; DB-Passwort wird bei jedem Lauf durchgesetzt; DB-Passwort nicht mehr im world-readable systemd-Unit-File |
+| 1.12 | `sudo` fehlte in der Preflight-Paketliste (LXC-Minimal-Templates) |
+| 1.13 | Automatisches Health-Check-Rollback, DB-Backup vor jeder Migration, Log-Rotation, `git fetch`+`reset --hard` statt `pull`, harter Diskspace-Abbruch, Firewall-Hinweis, Webhook-Benachrichtigung |
+| 1.14 | Aufbewahrungsgrenze für generische Zeitstempel-Backups (`GENERIC_BACKUP_KEEP`) |
+| 1.15 | Health-Check-Skip bei fester `ENV_OVERRIDE_SERVER_HOST`; Health-Check auch bei Erstinstallation; Rollback-Status in Webhook-Meldung; `chown -R` nur bei Bedarf |
+| 1.16 | Optionale Selbstprüfung auf neuere Script-Version gegen GitHub (`CHECK_FOR_UPDATES`) |
+| 1.17 | Selbstheilung bei fehlschlagendem `cargo build --release --locked` (Cargo.lock-Konflikt) |
+| **1.18** | **Review-Runde mit 13 Fixes/Verbesserungen**, siehe Abschnitt „Neuerungen in 1.18" unten: u. a. abgesicherte `latest`-Release-Ermittlung, vorgezogene Dependency-Verifizierung, optionales `GITHUB_TOKEN`, bedarfsgesteuerter + garantiert aufgeräumter Swapfile, neuer `current-good`-Rollback-Anker, tolerantere Health-Check-Codes, korrigierte ufw-Prüfung, Backup vor destruktivem Directory-Cleanup, sed-Escaping in `set_env_var()`, restriktivere Rechte auf `/etc/oxicloud`, robuste Diskspace-Ermittlung und neuer `DRY_RUN`-Modus |
 
 ---
 
@@ -40,6 +41,162 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerungen in 1.18
+
+Dreizehn Verbesserungen aus einer weiteren Review-Runde — drei davon
+echte Bugfixes, der Rest Härtung und ein neuer Simulationsmodus.
+
+### 1. Bugfix: `latest`-Release-Ermittlung gegen fehlschlagenden curl abgesichert
+
+`resolve_target_ref()` (nur relevant bei `OXICLOUD_VERSION_PIN="latest"`)
+rief `api.github.com` unter `set -e -o pipefail` auf, **ohne** die Pipe
+gegen einen fehlschlagenden `curl` abzusichern — anders als die analoge,
+bereits in 1.11 gefixte Node-LTS-Ermittlung. Schlug der Aufruf fehl (kein
+Internet, GitHub down, Rate-Limit), brach die Pipe sofort und
+**stillschweigend** ab; die eigentlich vorgesehene Fehlermeldung
+(„Konnte neuestes GitHub-Release nicht ermitteln") wurde nie erreicht.
+Jetzt mit `|| true` abgesichert, analog zum 1.11-Fix — die bestehende
+Fehlerbehandlung greift wie ursprünglich vorgesehen, inklusive eines
+neuen Hinweises auf `GITHUB_TOKEN` (siehe Punkt 3) als mögliche Ursache.
+
+### 2. Dependency-Verifizierung deutlich nach vorne verschoben
+
+Der Block „Verifiziere, dass alle benötigten Programme tatsächlich
+verfügbar sind" (git, curl, jq, openssl, psql) lief bisher **nach** dem
+DB-Backup und `cargo sqlx migrate run` — beide setzen `psql` bzw. `cargo`
+bereits voraus. Fehlte eines der Basis-Tools trotz Preflight, scheiterte
+der Lauf an dieser Stelle mit einem unklaren Fehler mitten in der
+DB-Logik, statt mit der eigentlich vorgesehenen klaren Meldung. Die
+Basis-Verifizierung (`git`, `curl`, `jq`, `openssl`, `psql`) läuft jetzt
+direkt nach dem Preflight-Check; die Verifizierung von `node`/`npm`/`cargo`
+folgt weiterhin nach deren Installation/Update, aber weiterhin **vor** dem
+eigentlichen Build.
+
+### 3. Optionales `GITHUB_TOKEN`
+
+Neue Konfigurationsvariable `GITHUB_TOKEN` (leer = Standard, anonyme
+Aufrufe). Falls gesetzt, wird sie als `Authorization: token ...`-Header an
+**beide** GitHub-API-Aufrufe angehängt: den Update-Check (1.16) und die
+`OXICLOUD_VERSION_PIN=latest`-Auflösung. Relevant vor allem bei häufigen
+automatisierten Läufen (Cron) von derselben IP, die sonst leichter ins
+anonyme GitHub-Rate-Limit (60 Requests/Stunde) laufen können — was dank
+Fix 1 zwar nicht mehr hart abbricht, aber weiterhin unnötig wäre. Ein
+Token ohne besondere Rechte (reines Anheben des Rate-Limits) genügt.
+
+### 4. Swapfile wird nur noch bei tatsächlich anstehendem Rebuild angelegt
+
+Die automatische Swapfile-Logik (OOM-Schutz beim Kompilieren) prüfte
+bisher nur RAM und ob bereits Swap aktiv ist — **nicht**, ob `NEED_BUILD`
+überhaupt `1` ist. Bei knappem RAM legte das Script also bei **jedem**
+Lauf (auch reinen „nichts geändert"-Läufen) einen 8-GB-Swapfile per
+`fallocate`+`mkswap`+`swapon` an und entfernte ihn am Ende wieder —
+unnötiger I/O- und Zeitaufwand. Die Bedingung prüft jetzt zusätzlich
+`NEED_BUILD -eq 1`.
+
+### 5. Swapfile-Cleanup läuft jetzt garantiert über den EXIT-Trap
+
+Vorher wurde ein automatisch angelegter Swapfile nur am **glücklichen**
+Skriptende wieder entfernt. Brach das Script vorher ab — DB-Backup
+fehlgeschlagen, Migration fehlgeschlagen, Health-Check fehlgeschlagen
+(jeweils `exit 1`) — blieb der Swapfile dauerhaft aktiv und in
+`/etc/fstab` eingetragen. Der bestehende `trap ... EXIT`-Mechanismus
+(bisher nur für die Webhook-Benachrichtigung genutzt, jetzt
+`cleanup_on_exit` statt `notify_on_failure`) räumt den Swapfile jetzt bei
+**jedem** Skriptende auf, unabhängig vom Exit-Code.
+
+### 6. Neuer `current-good`-Symlink als verlässliches Rollback-Ziel
+
+Bisher zielte das automatische Rollback auf „das zuletzt modifizierte
+**andere** Release unter `releases/`" — ohne Garantie, dass dieses Release
+selbst jemals einen Health-Check bestanden hat. Bei zwei aufeinanderfolgenden
+kaputten Commits konnte das Rollback also auf ein ebenfalls defektes
+Release zeigen. Neu ist der Symlink `${OXICLOUD_HOME}/current-good`, der
+**ausschließlich** nach einem erfolgreichen Health-Check aktualisiert wird
+(`ln -sfn` auf das aktuell aktive Release). Automatisches Rollback zielt
+jetzt auf `current-good` statt auf eine reine Zeitstempel-Heuristik; die
+Release-Bereinigung (`KEEP_RELEASES`) nimmt `current-good` zusätzlich zu
+`current` von der Löschung aus.
+
+### 7. Health-Check akzeptiert konfigurierbare HTTP-Codes
+
+Der Health-Check nutzte bisher `curl -fsS`, was **jeden** Nicht-2xx-Status
+als „Dienst down" wertete. Antwortet OxiCloud auf `/` z. B. mit einem
+Redirect (301/302) oder verlangt Auth (401), ist das trotzdem ein Beweis,
+dass der Dienst lebt und antwortet — wurde vorher aber fälschlich als
+Fehlschlag gewertet und hätte ein unnötiges Rollback ausgelöst. Zwei neue
+Variablen steuern das jetzt:
+
+- `HEALTH_CHECK_PATH` (Standard `"/"`) — der geprüfte Pfad
+- `HEALTH_CHECK_EXPECTED_CODES` (Standard `"200 301 302 401"`) — Leerzeichen-
+  getrennte Liste akzeptierter HTTP-Statuscodes
+
+Der Check liest jetzt den tatsächlichen Statuscode
+(`curl -s -o /dev/null -w '%{http_code}'`) und vergleicht ihn gegen diese
+Liste, statt sich auf `curl -f` zu verlassen.
+
+### 8. ufw-Firewall-Hinweis prüft jetzt zuerst, ob ufw aktiv ist
+
+Der bisherige Check fragte direkt `ufw status | grep -qE "^PORT... ALLOW"`
+ab. War `ufw` zwar installiert, aber **inaktiv** (`Status: inactive`),
+matchte das Grep naturgemäß nicht — das Script warnte dann fälschlich vor
+einem „nicht freigegebenen Port", obwohl inaktives ufw gar nichts
+blockiert (der Port ist in dem Fall ohnehin offen). Der Check fragt jetzt
+zuerst `ufw status | grep -q "Status: active"` ab und gibt bei inaktivem
+ufw stattdessen einen allgemeineren, korrekten Hinweis aus.
+
+### 9. Backup vor destruktivem Directory-Cleanup
+
+War `OXICLOUD_HOME` nicht leer, aber (noch) kein Git-Repository, wurde der
+Inhalt bisher kommentarlos per `rm -rf` gelöscht — im Gegensatz zum
+sonstigen Vorsichtsprinzip des Scripts (Backups vor `.env`, systemd-Unit,
+`/etc/fstab`). Falls `OXICLOUD_HOME` versehentlich auf ein bereits
+genutztes Verzeichnis zeigt, legt das Script jetzt vorher einen Tarball
+unter `/etc/oxicloud/pre-clone-backups/oxicloud-home-<timestamp>.tar.gz`
+an (best effort — schlägt das Tarball-Backup selbst fehl, wird das
+geloggt, der Lauf aber nicht deswegen abgebrochen).
+
+### 10. `set_env_var()` escaped Sonderzeichen für `sed`
+
+Die Funktion ersetzte `.env`-Werte bisher über `sed -i "s#^KEY=.*#KEY=VALUE#"`
+ohne den Wert zu escapen. Enthielt `VALUE` selbst ein `&` (Sed-Sonderzeichen
+im Ersetzungsteil, wird zum gesamten Match) oder das Delimiter-Zeichen `#`,
+konnte das zu einer falschen Ersetzung oder einem Sed-Fehler führen — z. B.
+bei einer `ENV_OVERRIDE_BASE_URL` mit Fragment oder Query-String. Der Wert
+wird jetzt vor dem Einsetzen escaped (`&`, `/`, `\`).
+
+### 11. Restriktivere Rechte auf `/etc/oxicloud`
+
+Einzelne Dateien darin waren immer schon geschützt (`.env` 640,
+`.db_password` 600, DB-Backups 600), das Verzeichnis selbst aber ohne
+explizite Rechte (Standard-`umask` von `mkdir -p`). Andere lokale User
+konnten damit zumindest das Directory-Listing einsehen (z. B. Dateinamen
+der DB-Backups). `/etc/oxicloud` bekommt jetzt `chmod 750`.
+
+### 12. Robuste Diskspace-Ermittlung
+
+`ACTUAL_DISK_GB` wurde per `df --output=avail ... | tail -1 | tr -dc '0-9'`
+ermittelt. Bei einem exotischen oder (temporär) nicht existierenden
+`OXICLOUD_HOME`-Elternverzeichnis konnte das eine leere Zeichenkette statt
+einer Zahl liefern — der spätere Integer-Vergleich (`-lt`) wäre dann mit
+„integer expression expected" abgestürzt, statt die vorgesehene
+Fehlerbehandlung zu durchlaufen. `: "${ACTUAL_DISK_GB:=0}"` erzwingt jetzt
+einen sauberen Fallback auf `0`.
+
+### 13. Neuer `DRY_RUN`-Modus
+
+Neue Konfigurationsvariable `DRY_RUN` (Standard `false`). Bei `true`
+werden alle destruktiven/ändernden Schritte — `chown`, `git reset --hard`,
+Paketinstallationen, Node/Rust-Updates, DB-Rolle/Passwort, `.env`-Schreiben,
+Build, systemd-Aktionen, Swapfile/Firewall-Änderungen — nur mit `[DRY_RUN]`
+geloggt statt ausgeführt. Nützlich, um eine geänderte Konfiguration
+(`ENV_OVERRIDE_*`, Pins, `ENABLE_PLUGINS`, ...) vorab durchzuspielen und
+den geplanten Ablauf zu sehen, ohne den laufenden Dienst oder das System
+tatsächlich zu beeinflussen. Health-Check und Rollback-Logik werden bei
+`DRY_RUN=true` komplett übersprungen, da es nichts Reales gibt, das
+geprüft werden könnte.
 
 ---
 
@@ -97,9 +254,8 @@ Hinweis: Auf GitHub liegt eine andere Version von install-oxicloud.sh
 Wichtig, was das **nicht** tut:
 - **Kein automatisches Update.** Es wird nichts heruntergeladen, ersetzt
   oder ausgeführt — nur die Versionsnummer im Header des Remote-Scripts
-  wird per `curl` abgerufen und verglichen. Ein Script, das sich selbst
-  überschreibt, wäre ein unnötiges Einfallstor (Supply-Chain-Risiko, falls
-  Repo oder Verbindung kompromittiert sind).
+  wird per `curl` (seit 1.18 optional mit `GITHUB_TOKEN`, siehe „Neuerungen
+  in 1.18", Punkt 3) abgerufen und verglichen.
 - **Kein Abbruch bei Fehlschlag.** Kein Internet, GitHub nicht erreichbar,
   Rate-Limit, kein `curl` vorhanden — in jedem Fall wird der Check still
   übersprungen (`|| true`, 5s Timeout), der eigentliche Install-/Update-Lauf
@@ -123,15 +279,16 @@ Randfällen falsch verhalten hätte.
 
 ### 1. Health-Check wird bei fester, nicht-lokaler `ENV_OVERRIDE_SERVER_HOST` übersprungen
 
-Der Health-Check prüft fest gegen `http://127.0.0.1:${OXICLOUD_PORT}/`. Für
-`0.0.0.0`/`::` (Dienst lauscht auf allen Interfaces, `127.0.0.1` also
-eingeschlossen) ist das kein Problem. Wird `ENV_OVERRIDE_SERVER_HOST` aber
-auf eine **feste, andere** Adresse gesetzt (z. B. `"192.168.1.50"`),
-lauscht der Dienst dort und nicht mehr auf `127.0.0.1` — der Check wäre
-dann bei **jedem** Rebuild fälschlich fehlgeschlagen und hätte ein
-unnötiges Rollback ausgelöst, obwohl der Dienst einwandfrei läuft. Das
-Script überspringt den Check jetzt in diesem Fall bewusst, mit dem
-Hinweis, den Dienst manuell zu prüfen (`systemctl status oxicloud`).
+Der Health-Check prüft fest gegen `http://127.0.0.1:${OXICLOUD_PORT}${HEALTH_CHECK_PATH}`
+(Pfad seit 1.18 konfigurierbar, siehe oben). Für `0.0.0.0`/`::` (Dienst
+lauscht auf allen Interfaces, `127.0.0.1` also eingeschlossen) ist das
+kein Problem. Wird `ENV_OVERRIDE_SERVER_HOST` aber auf eine **feste,
+andere** Adresse gesetzt (z. B. `"192.168.1.50"`), lauscht der Dienst dort
+und nicht mehr auf `127.0.0.1` — der Check wäre dann bei **jedem** Rebuild
+fälschlich fehlgeschlagen und hätte ein unnötiges Rollback ausgelöst,
+obwohl der Dienst einwandfrei läuft. Das Script überspringt den Check
+jetzt in diesem Fall bewusst, mit dem Hinweis, den Dienst manuell zu
+prüfen (`systemctl status oxicloud`).
 
 ### 2. Health-Check läuft jetzt auch bei der Erstinstallation
 
@@ -140,18 +297,20 @@ Lauf, weil nur dann ein Rollback-Ziel existiert. Damit wurde eine kaputte
 **Erstinstallation** (z. B. fehlerhafte `.env`) nie geprüft — das Script
 meldete am Ende trotzdem unkommentiert "erfolgreich installiert". Jetzt
 läuft der Check immer; nur der eigentliche Rollback-Schritt bleibt
-naturgemäß auf den Fall beschränkt, dass es ein vorheriges Release gibt.
-Schlägt der Check bei der Erstinstallation fehl, bricht das Script mit
-einer klaren Fehlermeldung ab, statt fälschlich Erfolg zu melden.
+naturgemäß auf den Fall beschränkt, dass es ein `current-good`-Release
+gibt (seit 1.18, siehe oben — vorher „ein vorheriges Release"). Schlägt
+der Check bei der Erstinstallation fehl, bricht das Script mit einer
+klaren Fehlermeldung ab, statt fälschlich Erfolg zu melden.
 
 ### 3. Rollback-Status fließt in die Webhook-Meldung ein
 
 Die interne Variable, die bisher nur "es gab ein Rollback" markierte, ohne
 je gelesen zu werden, wurde entfernt. Stattdessen trägt ein aussagekräftiger
-Text (z. B. "Automatisches Rollback auf .../oxicloud-<hash> erfolgreich.")
-jetzt direkt in die `NOTIFY_WEBHOOK_URL`-Meldung ein — bei einem
-unbeaufsichtigten Cron-Lauf seht ihr damit sofort im Chat/Webhook, *warum*
-der Lauf fehlgeschlagen ist, statt nur eines generischen Exit-Codes.
+Text (z. B. "Automatisches Rollback auf .../oxicloud-<hash> (current-good)
+erfolgreich.") jetzt direkt in die `NOTIFY_WEBHOOK_URL`-Meldung ein — bei
+einem unbeaufsichtigten Cron-Lauf seht ihr damit sofort im Chat/Webhook,
+*warum* der Lauf fehlgeschlagen ist, statt nur eines generischen
+Exit-Codes.
 
 ### 4. `chown -R` läuft nur noch, wenn tatsächlich nötig
 
@@ -192,11 +351,9 @@ statt dass der zweite Aufruf den ersten Backup-Stand stillschweigend
 Zusätzlich wurden `DISK_ABORT_THRESHOLD_GB`, `DB_BACKUP_KEEP` und
 `HEALTH_RETRIES` (alle drei aus 1.13) sowie das neue `GENERIC_BACKUP_KEEP`
 aus ihren bisherigen Positionen direkt über der jeweiligen Codestelle in
-den zentralen Konfigurationsblock am Scriptanfang verschoben. Der Grund:
-Es gibt keinen guten inhaltlichen Grund, warum diese vier anders behandelt
-werden sollten als z. B. `KEEP_RELEASES`, das von Anfang an dort stand —
-alle anpassbaren Werte sollten an einer Stelle einsehbar sein, statt
-teils verstreut im Code zu stehen.
+den zentralen Konfigurationsblock am Scriptanfang verschoben — seit 1.18
+gilt das ebenso für alle neuen Variablen (`GITHUB_TOKEN`, `DRY_RUN`,
+`HEALTH_CHECK_PATH`, `HEALTH_CHECK_EXPECTED_CODES`).
 
 ---
 
@@ -208,28 +365,32 @@ statt sie erst später kryptisch auffallen zu lassen.
 
 ### 1. Automatisches Health-Check-Rollback
 
-Bisher (siehe „Versionierte Releases & manuelles Rollback" weiter unten in
-der alten Fassung) war Rollback ein rein manueller Schritt — obwohl das
-Script mit den nach Git-Commit-Hash versionierten Binaries unter
-`releases/` und dem `current`-Symlink die Infrastruktur dafür längst hatte.
+Bisher war Rollback ein rein manueller Schritt — obwohl das Script mit
+den nach Git-Commit-Hash versionierten Binaries unter `releases/` und dem
+`current`-Symlink die Infrastruktur dafür längst hatte.
 
-Jetzt gilt: Nach einem Rebuild + Neustart prüft das Script bis zu 10x im
-Abstand von 2 Sekunden, ob der Dienst aktiv ist **und** auf
-`http://127.0.0.1:${OXICLOUD_PORT}/` antwortet. Schlägt das fehl:
+Jetzt gilt: Nach einem Rebuild + Neustart prüft das Script bis zu
+`HEALTH_RETRIES`-mal im Abstand von 2 Sekunden, ob der Dienst aktiv ist
+**und** auf `http://127.0.0.1:${OXICLOUD_PORT}${HEALTH_CHECK_PATH}` mit
+einem der `HEALTH_CHECK_EXPECTED_CODES` antwortet (Pfad/Codes
+konfigurierbar seit 1.18, siehe „Neuerungen in 1.18", Punkt 7). Schlägt
+das fehl:
 
 ```
-FEHLER: Dienst antwortet nach 10 Versuchen (je 2s) nicht auf Port 8086.
+FEHLER: Dienst antwortet nach 10 Versuchen (je 2s) nicht auf Port 8086/.
     Prüfe: journalctl -u oxicloud -n 50 --no-pager
-    Rolle automatisch zurück auf vorheriges Release: /opt/oxicloud/releases/oxicloud-<alter-hash>
+    Rolle automatisch zurück auf zuletzt gesundes Release: /opt/oxicloud/releases/oxicloud-<alter-hash>
     Rollback erfolgreich, Dienst läuft wieder mit /opt/oxicloud/releases/oxicloud-<alter-hash>.
 ```
 
-`current` wird automatisch auf das vorherige Release zurückgesetzt, der
-Dienst erneut gestartet, und das Script beendet sich danach trotzdem mit
-Exit-Code 1 (damit ein automatisierter/Cron-Lauf den Fehlschlag als
-solchen erkennt — siehe Punkt 7). Gibt es kein vorheriges Release (erster
-Lauf überhaupt) oder scheitert auch der Rollback-Neustart, wird das
-deutlich ausgegeben — dann ist manueller Eingriff nötig.
+`current` wird automatisch auf das Release hinter `current-good`
+zurückgesetzt (seit 1.18, siehe „Neuerungen in 1.18", Punkt 6 — vorher:
+„das zuletzt modifizierte andere Release"), der Dienst erneut gestartet,
+und das Script beendet sich danach trotzdem mit Exit-Code 1 (damit ein
+automatisierter/Cron-Lauf den Fehlschlag als solchen erkennt — siehe
+Punkt 7). Gibt es kein `current-good`-Release (z. B. Erstinstallation)
+oder scheitert auch der Rollback-Neustart, wird das deutlich ausgegeben —
+dann ist manueller Eingriff nötig.
 
 ### 2. Automatisches DB-Backup vor jeder Migration
 
@@ -240,10 +401,9 @@ Backup. Jetzt läuft direkt davor:
 sudo -u postgres pg_dump "${DB_NAME}" | gzip > /etc/oxicloud/db-backups/oxicloud-<timestamp>.sql.gz
 ```
 
-mit `chmod 600` und automatischer Bereinigung auf die letzten 10 Stände
-(`DB_BACKUP_KEEP`, hartkodiert direkt über der entsprechenden Codestelle,
-nicht im Konfigurationsblock am Scriptanfang). Schlägt das Backup selbst
-fehl, bricht das Script **vor** der Migration ab, statt eine potenziell
+mit `chmod 600` und automatischer Bereinigung auf die letzten
+`DB_BACKUP_KEEP` Stände (Standard 10). Schlägt das Backup selbst fehl,
+bricht das Script **vor** der Migration ab, statt eine potenziell
 riskante Migration ohne Sicherheitsnetz laufen zu lassen.
 
 ### 3. Log-Rotation für das Install-Log
@@ -258,14 +418,14 @@ wird).
 ### 4. `git fetch` + `reset --hard origin/main` statt `git pull`
 
 Passend zur bereits bestehenden Philosophie, dass `/opt/oxicloud`
-ausschließlich vom Script verwaltet wird (siehe Patch-Backup lokaler
-Änderungen weiter unten): `git pull origin main` konnte an einem
-divergierten main scheitern, z. B. nach einem Force-Push upstream im
-Repository. `git fetch origin main` + `git reset --hard origin/main`
-erzwingt stattdessen immer exakt den Stand von `origin/main`, unabhängig
-von der lokalen Historie. Betrifft nur den Fall, dass kein
-`OXICLOUD_VERSION_PIN` gesetzt ist (also dem `main`-Branch gefolgt wird) —
-bei einem festen Tag/Release lief es schon vorher über `git checkout`.
+ausschließlich vom Script verwaltet wird: `git pull origin main` konnte
+an einem divergierten main scheitern, z. B. nach einem Force-Push
+upstream im Repository. `git fetch origin main` + `git reset --hard
+origin/main` erzwingt stattdessen immer exakt den Stand von
+`origin/main`, unabhängig von der lokalen Historie. Betrifft nur den
+Fall, dass kein `OXICLOUD_VERSION_PIN` gesetzt ist (also dem
+`main`-Branch gefolgt wird) — bei einem festen Tag/Release lief es schon
+vorher über `git checkout`.
 
 ### 5. Harter Abbruch bei kritisch wenig Diskspace
 
@@ -273,10 +433,10 @@ Bisher gab es nur eine Warnung, falls weniger als die empfohlenen ~20 GB
 frei waren; der Build lief trotzdem an und scheiterte im ungünstigsten
 Fall erst mitten in `cargo build --release`. Jetzt bricht das Script
 **vor** dem Build hart ab, wenn weniger als `DISK_ABORT_THRESHOLD_GB=5`
-GB frei sind (Wert hartkodiert direkt über der entsprechenden Codestelle
-im Ressourcen-Abschnitt, nicht im Konfigurationsblock), mit Hinweisen, wo
-sich am ehesten Platz freiräumen lässt (alte Releases, alte DB-Backups,
-`apt-get clean`).
+GB frei sind, mit Hinweisen, wo sich am ehesten Platz freiräumen lässt
+(alte Releases, alte DB-Backups, `apt-get clean`). Die zugrunde liegende
+Ermittlung der freien GB ist seit 1.18 zusätzlich gegen eine leere
+Rückgabe abgesichert (siehe „Neuerungen in 1.18", Punkt 12).
 
 ### 6. Firewall-Hinweis bei `0.0.0.0`/`::`
 
@@ -285,19 +445,25 @@ lauscht auf allen Interfaces), prüft das Script — falls `ufw` vorhanden
 ist — ob der Port dort freigegeben ist, und gibt andernfalls einen
 deutlichen Hinweis aus, das selbst zu prüfen (Portweiterleitung,
 Cloud-Security-Group, `ufw allow ${OXICLOUD_PORT}/tcp` falls gewünscht).
-Ist `ufw` nicht vorhanden, erfolgt ein allgemeinerer Hinweis, das über
-`nftables`/`iptables`/Cloud-Firewall manuell zu prüfen.
+Seit 1.18 wird dabei zuerst geprüft, ob ufw überhaupt **aktiv** ist,
+bevor vor einem angeblich nicht freigegebenen Port gewarnt wird (siehe
+„Neuerungen in 1.18", Punkt 8) — vorher kam die Warnung fälschlich auch
+bei inaktivem ufw. Ist `ufw` nicht vorhanden, erfolgt weiterhin ein
+allgemeinerer Hinweis, das über `nftables`/`iptables`/Cloud-Firewall
+manuell zu prüfen.
 
 ### 7. Optionale Fehler-Benachrichtigung per Webhook
 
-Neue Konfigurationsvariable `NOTIFY_WEBHOOK_URL` (leer = deaktiviert,
-Standard). Ein `trap` auf `EXIT` sorgt dafür, dass bei **jedem**
-Fehlschlag des Scripts (Exit-Code ≠ 0, unabhängig an welcher Stelle) eine
-kurze POST-Anfrage mit `{"text": "..."}` an die konfigurierte URL
-geschickt wird (kompatibel zu Slack-/Mattermost-Incoming-Webhooks).
-Relevant vor allem, falls das Script unbeaufsichtigt per Cron läuft — ohne
-das fällt ein fehlgeschlagener Auto-Update-Lauf sonst erst auf, wenn der
-Dienst schon länger down ist. Die Benachrichtigung selbst ist bewusst
+Konfigurationsvariable `NOTIFY_WEBHOOK_URL` (leer = deaktiviert,
+Standard). Ein `trap` auf `EXIT` (seit 1.18 `cleanup_on_exit`, siehe
+„Neuerungen in 1.18", Punkt 5 — übernimmt zusätzlich das
+Swapfile-Aufräumen) sorgt dafür, dass bei **jedem** Fehlschlag des
+Scripts (Exit-Code ≠ 0, unabhängig an welcher Stelle) eine kurze
+POST-Anfrage mit `{"text": "..."}` an die konfigurierte URL geschickt
+wird (kompatibel zu Slack-/Mattermost-Incoming-Webhooks). Relevant vor
+allem, falls das Script unbeaufsichtigt per Cron läuft — ohne das fällt
+ein fehlgeschlagener Auto-Update-Lauf sonst erst auf, wenn der Dienst
+schon länger down ist. Die Benachrichtigung selbst ist bewusst
 fehlertolerant (`|| true`, 10s Timeout) und verändert nie den eigentlichen
 Exit-Code des Scripts.
 
@@ -353,7 +519,7 @@ ausführen — Idempotenz sorgt dafür, dass der Rest des vorherigen
 
 Entstanden aus einem Code-Review, nicht aus einem konkreten Vorfall bei
 diesem Script — aber alle drei Muster waren real bei anderen Skripten des
-Projekts aufgetreten (siehe `migrate-nextcloud-direct.sh`-Changelog).
+Projekts aufgetreten.
 
 ### 1. `set -e`-Fallstrick bei der Node.js-LTS-Ermittlung
 
@@ -374,7 +540,9 @@ LATEST_LTS_MAJOR="$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null | 
 
 `LATEST_LTS_MAJOR` bleibt bei einem Fehlschlag einfach leer, der
 nachfolgende `if [[ -z "${LATEST_LTS_MAJOR}" ]]`-Fallback greift dann wie
-ursprünglich vorgesehen.
+ursprünglich vorgesehen. Derselbe Fallstrick wurde in 1.18 an der
+analogen Stelle für die `OXICLOUD_VERSION_PIN=latest`-Ermittlung gefunden
+und behoben (siehe „Neuerungen in 1.18", Punkt 1).
 
 ### 2. DB-Passwort wurde nur beim Erstanlegen der Rolle gesetzt
 
@@ -440,9 +608,10 @@ Ein erneuter Lauf von `install-oxicloud.sh` schreibt die Unit ohnehin neu
   nachinstalliert, siehe „Fix in 1.12" oben; **auf minimalen LXC-Templates
   vorher trotzdem sinnvoll, einmal manuell zu prüfen, ob es schon da ist**)
 - Internetzugang auf dem Zielserver (für `apt`, GitHub, crates.io, npm-Registry, rustup, NodeSource, optional den Webhook-Endpunkt aus `NOTIFY_WEBHOOK_URL`)
-- Ausreichend Ressourcen zum Kompilieren — siehe Abschnitt „Ressourcenbedarf" unten. Fehlt genug RAM, legt das Script selbst einen temporären Swapfile an. Seit 1.13 bricht das Script bei kritisch wenig Diskspace vor dem Build hart ab, statt nur zu warnen (siehe „Neuerungen in 1.13", Punkt 5).
+- Ausreichend Ressourcen zum Kompilieren — siehe Abschnitt „Ressourcenbedarf" unten. Fehlt genug RAM **und** steht ein Rebuild an, legt das Script selbst einen temporären Swapfile an (seit 1.18 nur noch bei tatsächlich anstehendem Rebuild, siehe „Neuerungen in 1.18", Punkt 4). Seit 1.13 bricht das Script bei kritisch wenig Diskspace vor dem Build hart ab, statt nur zu warnen.
 - `logrotate` (optional): falls vorhanden, richtet das Script seit 1.13 automatisch eine Rotation für `/var/log/oxicloud-install.log` ein
-- `curl` erreichbar auf `127.0.0.1:${OXICLOUD_PORT}` (für den seit 1.13 vorhandenen Health-Check nach jedem Rebuild)
+- `curl` erreichbar auf `127.0.0.1:${OXICLOUD_PORT}` (für den seit 1.13 vorhandenen, seit 1.18 konfigurierbaren Health-Check nach jedem Rebuild)
+- optional: ein `GITHUB_TOKEN` (seit 1.18), falls häufige automatisierte Läufe ins anonyme GitHub-Rate-Limit laufen könnten
 
 Wird **auf dem Zielserver selbst** installiert:
 - Rust (via `rustup`, Benutzer-lokal)
@@ -462,6 +631,11 @@ Kein Parameter nötig — alle Einstellungen erfolgen über den
 Konfigurationsblock am Scriptanfang (siehe unten) oder durch erneutes
 Ausführen mit geänderten Werten dort.
 
+**Testlauf ohne echte Änderungen** (neu in 1.18): `DRY_RUN=true` im
+Konfigurationsblock setzen, dann normal ausführen. Alle geplanten
+Schritte werden mit `[DRY_RUN]`-Präfix geloggt, aber nicht ausgeführt
+(siehe „Neuerungen in 1.18", Punkt 13).
+
 ---
 
 ## Konfigurationsblock (Kopf des Scripts)
@@ -470,35 +644,36 @@ Ausführen mit geänderten Werten dort.
 |---|---|---|
 | `OXICLOUD_USER` | `oxicloud` | Systemuser, unter dem geklont/gebaut/betrieben wird |
 | `OXICLOUD_HOME` | `/opt/oxicloud` | Git-Working-Copy **und** Installationsort — wird ausschließlich vom Script verwaltet |
-| `OXICLOUD_PORT` | `8086` | Anzeige-URL am Ende **und** seit 1.13 Ziel des automatischen Health-Checks nach jedem Rebuild |
+| `OXICLOUD_PORT` | `8086` | Anzeige-URL am Ende **und** Ziel des automatischen Health-Checks nach jedem Rebuild |
 | `DB_NAME` / `DB_USER` | `oxicloud` | Name von Datenbank und Postgres-Rolle |
 | `REPO_URL` | `https://github.com/AtalayaLabs/OxiCloud.git` | Woher geklont wird — siehe Hinweis im Script zur Doppel-Existenz von `DioCrafts/OxiCloud` und `AtalayaLabs/OxiCloud` |
-| `KEEP_RELEASES` | `5` | Wie viele alte versionierte Binaries behalten werden; `0` = nichts löschen |
+| `DRY_RUN` *(neu in 1.18)* | `false` | `true` = keine echten Systemänderungen, alle destruktiven/ändernden Schritte werden nur geloggt |
+| `KEEP_RELEASES` | `5` | Wie viele alte versionierte Binaries behalten werden; `0` = nichts löschen. Das aktive Release **und** `current-good` bleiben davon immer ausgenommen |
 | `NODE_VERSION_PIN` | leer | Leer = immer neueste LTS-Major-Version; sonst z. B. `"22"` |
 | `RUST_VERSION_PIN` | leer | Leer = immer `rustup update stable`; sonst z. B. `"1.82.0"` |
-| `ENV_OVERRIDE_SERVER_HOST` | leer | Überschreibt `OXICLOUD_SERVER_HOST` in der `.env`, z. B. `"0.0.0.0"` — seit 1.13 mit Firewall-Hinweis bei `0.0.0.0`/`::` |
-| `ENV_OVERRIDE_BASE_URL` | leer | Überschreibt `OXICLOUD_BASE_URL` in der `.env`, z. B. `"https://cloud.example.com"` |
-| `OXICLOUD_VERSION_PIN` | leer | Leer = folgt `main`-Branch; `"latest"` = neuestes GitHub-Release; `"vX.Y.Z"` = fester Tag |
+| `ENV_OVERRIDE_SERVER_HOST` | leer | Überschreibt `OXICLOUD_SERVER_HOST` in der `.env`, z. B. `"0.0.0.0"` — mit Firewall-Hinweis bei `0.0.0.0`/`::` (seit 1.18 nur bei aktivem ufw, siehe oben) |
+| `ENV_OVERRIDE_BASE_URL` | leer | Überschreibt `OXICLOUD_BASE_URL` in der `.env`, z. B. `"https://cloud.example.com"` — Sonderzeichen werden seit 1.18 korrekt escaped |
+| `OXICLOUD_VERSION_PIN` | leer | Leer = folgt `main`-Branch; `"latest"` = neuestes GitHub-Release (seit 1.18 robust gegen fehlschlagenden Abruf, siehe oben); `"vX.Y.Z"` = fester Tag |
 | `ENABLE_PLUGINS` | `false` | `true` baut mit Cargo-Feature `plugins` (WASM-Runtime via Extism) und setzt `OXICLOUD_ENABLE_PLUGINS=true` |
-| `NOTIFY_WEBHOOK_URL` *(neu in 1.13)* | leer | Leer = keine Benachrichtigung; sonst Slack-/Mattermost-kompatible Webhook-URL, die bei jedem fehlgeschlagenen Lauf (Exit-Code ≠ 0) einen POST mit `{"text": "..."}` erhält |
-| `GENERIC_BACKUP_KEEP` *(neu in 1.14)* | `10` | Wie viele Zeitstempel-Backups **pro Datei** in den jeweiligen `backups/`-Unterordnern behalten werden (`.env`, systemd-Unit, `/etc/fstab`); `0` = keine Bereinigung |
-| `DB_BACKUP_KEEP` *(neu in 1.13, seit 1.14 zentral)* | `10` | Wie viele DB-Backups unter `/etc/oxicloud/db-backups` behalten werden; `0` = keine Bereinigung |
-| `DISK_ABORT_THRESHOLD_GB` *(neu in 1.13, seit 1.14 zentral)* | `5` | Unterhalb dieser freien GB im Ressourcen-Check bricht das Script vor dem Build hart ab |
-| `HEALTH_RETRIES` *(neu in 1.13, seit 1.14 zentral)* | `10` | Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild versucht wird, bevor ein Rollback ausgelöst wird |
-| `CHECK_FOR_UPDATES` *(neu in 1.16)* | `true` | Prüft bei jedem Lauf (gecacht, siehe `UPDATE_CHECK_INTERVAL_HOURS`), ob im GitHub-Repo eine andere Script-Version liegt — rein informativ, `false` deaktiviert den Check komplett |
-| `UPDATE_CHECK_REPO` *(neu in 1.16)* | `roswitina/oxicloud-install` | GitHub-Repo (`owner/repo`), gegen das die Versionsprüfung läuft |
-| `UPDATE_CHECK_BRANCH` *(neu in 1.16)* | `main` | Branch, aus dem die Referenzversion gelesen wird |
-| `UPDATE_CHECK_INTERVAL_HOURS` *(neu in 1.16)* | `24` | Mindestabstand zwischen zwei tatsächlichen GitHub-Abrufen (Cache-Datei) |
+| `NOTIFY_WEBHOOK_URL` | leer | Leer = keine Benachrichtigung; sonst Slack-/Mattermost-kompatible Webhook-URL, die bei jedem fehlgeschlagenen Lauf (Exit-Code ≠ 0) einen POST mit `{"text": "..."}` erhält |
+| `GENERIC_BACKUP_KEEP` | `10` | Wie viele Zeitstempel-Backups **pro Datei** in den jeweiligen `backups/`-Unterordnern behalten werden (`.env`, systemd-Unit, `/etc/fstab`); `0` = keine Bereinigung |
+| `DB_BACKUP_KEEP` | `10` | Wie viele DB-Backups unter `/etc/oxicloud/db-backups` behalten werden; `0` = keine Bereinigung |
+| `DISK_ABORT_THRESHOLD_GB` | `5` | Unterhalb dieser freien GB im Ressourcen-Check bricht das Script vor dem Build hart ab (Ermittlung seit 1.18 robust gegen leere Rückgabe) |
+| `HEALTH_RETRIES` | `10` | Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild versucht wird, bevor ein Rollback ausgelöst wird |
+| `HEALTH_CHECK_PATH` *(neu in 1.18)* | `"/"` | Pfad, gegen den der Health-Check läuft |
+| `HEALTH_CHECK_EXPECTED_CODES` *(neu in 1.18)* | `"200 301 302 401"` | Leerzeichen-getrennte Liste akzeptierter HTTP-Statuscodes für den Health-Check |
+| `CHECK_FOR_UPDATES` | `true` | Prüft bei jedem Lauf (gecacht, siehe `UPDATE_CHECK_INTERVAL_HOURS`), ob im GitHub-Repo eine andere Script-Version liegt — rein informativ, `false` deaktiviert den Check komplett |
+| `UPDATE_CHECK_REPO` | `roswitina/oxicloud-install` | GitHub-Repo (`owner/repo`), gegen das die Versionsprüfung läuft |
+| `UPDATE_CHECK_BRANCH` | `main` | Branch, aus dem die Referenzversion gelesen wird |
+| `UPDATE_CHECK_INTERVAL_HOURS` | `24` | Mindestabstand zwischen zwei tatsächlichen GitHub-Abrufen (Cache-Datei) |
+| `GITHUB_TOKEN` *(neu in 1.18)* | leer | Optionales Token, wird als `Authorization: token ...`-Header an alle GitHub-API-Aufrufe angehängt (Update-Check + `OXICLOUD_VERSION_PIN=latest`) — hebt das anonyme Rate-Limit an |
 
 Alle `ENV_OVERRIDE_*`-Variablen greifen nur, wenn nicht leer — leer lassen
 heißt: Standardwert aus `example.env` bleibt unangetastet.
 
 Seit 1.14 stehen **alle** anpassbaren Werte gesammelt im
-Konfigurationsblock am Scriptanfang — in 1.13 waren `DISK_ABORT_THRESHOLD_GB`,
-`DB_BACKUP_KEEP` und `HEALTH_RETRIES` noch direkt über ihrer jeweiligen
-Codestelle verstreut. Das war unnötig inkonsistent, da sie sich vom
-Charakter her nicht von z. B. `KEEP_RELEASES` unterscheiden (siehe
-Abschnitt „Neuerung in 1.14" unten).
+Konfigurationsblock am Scriptanfang, inklusive der in 1.18 neu
+hinzugekommenen.
 
 ---
 
@@ -507,58 +682,69 @@ Abschnitt „Neuerung in 1.14" unten).
 1. **Preflight-Check**: `sudo`, `git`, `curl`, `jq`, `openssl`,
    `postgresql`, `postgresql-contrib`, `build-essential`, `pkg-config`,
    `libssl-dev`, `ca-certificates` werden geprüft und fehlende per `apt`
-   nachinstalliert. Seit 1.12 gehört `sudo` mit zur Liste (siehe „Fix in
-   1.12" oben) — vorher fehlte es hier, obwohl das Script ab Schritt 3 an
-   vielen Stellen darauf angewiesen ist. Seit 1.13 wird außerdem, falls
-   `logrotate` vorhanden ist, automatisch eine Rotation für
-   `/var/log/oxicloud-install.log` eingerichtet, und bei kritisch wenig
-   freiem Diskspace (< `DISK_ABORT_THRESHOLD_GB`) bricht das Script an
-   dieser Stelle bereits hart ab.
+   nachinstalliert. Seit 1.13 wird außerdem, falls `logrotate` vorhanden
+   ist, automatisch eine Rotation für `/var/log/oxicloud-install.log`
+   eingerichtet, und bei kritisch wenig freiem Diskspace
+   (< `DISK_ABORT_THRESHOLD_GB`) bricht das Script an dieser Stelle
+   bereits hart ab. **Seit 1.18** folgt direkt danach die Verifizierung,
+   dass `git`/`curl`/`jq`/`openssl`/`psql` tatsächlich verfügbar sind —
+   vorher lief dieser Check erst kurz vor dem Build, also nach DB-Backup
+   und Migration (siehe „Neuerungen in 1.18", Punkt 2).
 2. **Node.js & Rust**: werden installiert bzw. aktualisiert (oder auf die
    gepinnte Version gebracht, falls `NODE_VERSION_PIN`/`RUST_VERSION_PIN`
    gesetzt sind). Ein Versionswechsel bei einem der beiden löst automatisch
    einen Rebuild aus. Die Node.js-LTS-Ermittlung ist seit 1.11 gegen einen
-   stillen Script-Abbruch bei Netzwerkproblemen abgesichert (siehe oben).
+   stillen Script-Abbruch bei Netzwerkproblemen abgesichert. Direkt danach
+   (seit 1.18) wird zusätzlich verifiziert, dass `node`/`npm`/`cargo`
+   tatsächlich verfügbar sind.
 3. **Systemuser + PostgreSQL-Rolle/Datenbank**: werden angelegt, falls noch
-   nicht vorhanden. `OXICLOUD_HOME` wird bei jedem Lauf rekursiv auf
-   `oxicloud:oxicloud` zurückgesetzt (Selbstheilung). Seit 1.11 wird das
-   DB-Passwort zusätzlich bei **jedem** Lauf per `ALTER ROLE` durchgesetzt
-   und die Verbindung direkt verifiziert (siehe oben).
-4. **Klonen/Aktualisieren**: `git clone` bei Erstlauf; danach, sofern kein
-   `OXICLOUD_VERSION_PIN` gesetzt ist, seit 1.13 `git fetch` + `git reset
-   --hard origin/main` statt `git pull origin main` (siehe „Neuerungen in
-   1.13", Punkt 4). Lokale, nicht committete Änderungen an getrackten
-   Dateien werden weiterhin vorher als Patch unter
-   `local-changes-backup/` gesichert und dann verworfen.
+   nicht vorhanden. `OXICLOUD_HOME` wird bei Bedarf rekursiv auf
+   `oxicloud:oxicloud` zurückgesetzt (Selbstheilung, seit 1.15 nur falls
+   nötig). Seit 1.11 wird das DB-Passwort zusätzlich bei **jedem** Lauf
+   per `ALTER ROLE` durchgesetzt und die Verbindung direkt verifiziert.
+4. **Klonen/Aktualisieren**: `git clone` bei Erstlauf (ist `OXICLOUD_HOME`
+   dabei nicht-leer und noch kein Git-Repo, wird der Inhalt seit 1.18
+   vorher als Tarball gesichert, siehe „Neuerungen in 1.18", Punkt 9);
+   danach, sofern kein `OXICLOUD_VERSION_PIN` gesetzt ist, seit 1.13
+   `git fetch` + `git reset --hard origin/main` statt `git pull origin
+   main`. Lokale, nicht committete Änderungen an getrackten Dateien
+   werden weiterhin vorher als Patch unter `local-changes-backup/`
+   gesichert und dann verworfen.
 5. **`.env` erzeugen/ergänzen**: Bei Erstlauf wird `example.env` kopiert.
    Bei bereits bestehender `.env` werden nur **fehlende** Variablen aus
    einer neueren `example.env` automatisch angehängt — vorhandene Werte
-   bleiben unverändert. Seit 1.11 landet `DATABASE_URL` ebenfalls in der
-   `.env` (statt im systemd-Unit-File, siehe oben). Wird
-   `ENV_OVERRIDE_SERVER_HOST` auf `0.0.0.0`/`::` gesetzt, gibt das Script
-   seit 1.13 zusätzlich einen Firewall-Hinweis aus.
+   bleiben unverändert. `DATABASE_URL` landet seit 1.11 ebenfalls in der
+   `.env` (statt im systemd-Unit-File). Werte werden seit 1.18 vor dem
+   Einsetzen für `sed` escaped (siehe „Neuerungen in 1.18", Punkt 10).
+   Wird `ENV_OVERRIDE_SERVER_HOST` auf `0.0.0.0`/`::` gesetzt, gibt das
+   Script einen Firewall-Hinweis aus (seit 1.18 nur bei aktivem ufw
+   fälschungssicher formuliert).
 6. **DB-Backup + Migrationen**: Seit 1.13 läuft direkt vor der Migration
-   ein `pg_dump`-Backup nach `/etc/oxicloud/db-backups` (siehe „Neuerungen
-   in 1.13", Punkt 2); schlägt das Backup fehl, wird die Migration gar
-   nicht erst versucht. Danach läuft `cargo sqlx migrate run` wie bisher
-   bei **jedem** Lauf (idempotent, wendet nur ausstehende Migrationen an).
+   ein `pg_dump`-Backup nach `/etc/oxicloud/db-backups`; schlägt das
+   Backup fehl, wird die Migration gar nicht erst versucht. Danach läuft
+   `cargo sqlx migrate run` wie bisher bei **jedem** Lauf (idempotent,
+   wendet nur ausstehende Migrationen an).
 7. **Rebuild** (nur falls nötig): Frontend (`npm run build`) und Backend
-   (`cargo build --release --locked`) werden neu gebaut. Die entstehende
-   Binary wird nach ihrem Git-Commit-Hash versioniert unter `releases/`
-   abgelegt; der Symlink `current` zeigt danach darauf.
+   (`cargo build --release --locked`) werden neu gebaut. Steht ein
+   Rebuild an und ist wenig RAM frei, legt das Script vorher **seit
+   1.18 nur in diesem Fall** einen temporären Swapfile an (siehe
+   „Neuerungen in 1.18", Punkt 4), der garantiert über den EXIT-Trap
+   wieder entfernt wird (Punkt 5) — auch bei einem Abbruch mitten im
+   Build. Die entstehende Binary wird nach ihrem Git-Commit-Hash
+   versioniert unter `releases/` abgelegt; der Symlink `current` zeigt
+   danach darauf.
 8. **systemd**: Unit wird (neu) geschrieben (weiterhin ohne `DATABASE_URL`
-   im Klartext, siehe oben), Dienst bei Bedarf neu gestartet.
-9. **Health-Check + automatisches Rollback** *(neu in 1.13, seit 1.15 auch
-   bei der Erstinstallation aktiv)*: Läuft immer, wenn gerade neu
+   im Klartext), Dienst bei Bedarf neu gestartet.
+9. **Health-Check + automatisches Rollback**: Läuft immer, wenn gerade neu
    gebaut/gestartet wurde — außer `ENV_OVERRIDE_SERVER_HOST` ist auf eine
-   feste, nicht-lokale Adresse gesetzt, dann wird bewusst übersprungen
-   (siehe „Neuerungen in 1.15", Punkt 1). Antwortet der Dienst nicht
-   fristgerecht, wird automatisch auf das vorherige Release zurückgerollt,
-   sofern eines existiert (siehe „Neuerungen in 1.13", Punkt 1, und
-   „Neuerungen in 1.15", Punkt 2). Bei jedem Fehlschlag des gesamten Laufs
-   (Exit-Code ≠ 0) wird, falls `NOTIFY_WEBHOOK_URL` gesetzt ist, zusätzlich
-   eine Benachrichtigung verschickt, seit 1.15 inklusive Rollback-Status
-   im Text (siehe „Neuerungen in 1.15", Punkt 3).
+   feste, nicht-lokale Adresse gesetzt, dann wird bewusst übersprungen.
+   Der Check akzeptiert seit 1.18 konfigurierbare Pfade/Statuscodes (siehe
+   „Neuerungen in 1.18", Punkt 7). Antwortet der Dienst fristgerecht,
+   wird `current-good` aktualisiert (neu in 1.18, Punkt 6). Andernfalls
+   wird automatisch auf `current-good` zurückgerollt, sofern es existiert.
+   Bei jedem Fehlschlag des gesamten Laufs (Exit-Code ≠ 0) wird, falls
+   `NOTIFY_WEBHOOK_URL` gesetzt ist, zusätzlich eine Benachrichtigung
+   verschickt, inklusive Rollback-Status im Text.
 
 ---
 
@@ -566,38 +752,50 @@ Abschnitt „Neuerung in 1.14" unten).
 
 | Was | Mechanismus |
 |---|---|
-| DB-Passwort | Persistiert in `/etc/oxicloud/.db_password` (`chmod 600`), wiederverwendet statt neu generiert — **und seit 1.11 bei jedem Lauf aktiv gegen die Datenbank durchgesetzt** (`ALTER ROLE`), nicht nur beim Erstanlegen vorausgesetzt |
+| DB-Passwort | Persistiert in `/etc/oxicloud/.db_password` (`chmod 600`), wiederverwendet statt neu generiert — bei jedem Lauf aktiv gegen die Datenbank durchgesetzt (`ALTER ROLE`), nicht nur beim Erstanlegen vorausgesetzt |
 | Bestehende `.env`-Werte | Nur fehlende Variablen werden ergänzt, nichts wird überschrieben |
 | Lokale, nicht committete Änderungen in `OXICLOUD_HOME` | Werden vor jedem Pull/Reset als Patch unter `local-changes-backup/` gesichert (dann verworfen, da das Verzeichnis ausschließlich vom Script verwaltet werden soll) |
-| `.env`, systemd-Unit, `/etc/fstab` | Vor jedem Überschreiben wird eine Zeitstempel-Kopie in einem `backups/`-Unterordner neben der jeweiligen Datei angelegt — seit 1.14 begrenzt auf die neuesten `GENERIC_BACKUP_KEEP` Stände pro Datei, vorher unbegrenztes Wachstum |
-| Alte Releases | Über `KEEP_RELEASES` gesteuert; die aktive Version wird nie automatisch gelöscht |
-| DB-Backups *(neu in 1.13)* | Unter `/etc/oxicloud/db-backups`, über `DB_BACKUP_KEEP` (Standard 10) gesteuert |
+| `.env`, systemd-Unit, `/etc/fstab` | Vor jedem Überschreiben wird eine Zeitstempel-Kopie in einem `backups/`-Unterordner neben der jeweiligen Datei angelegt — begrenzt auf die neuesten `GENERIC_BACKUP_KEEP` Stände pro Datei |
+| Nicht-leeres, noch nicht geklontes `OXICLOUD_HOME` *(neu in 1.18)* | Wird vor dem Leeren als Tarball unter `/etc/oxicloud/pre-clone-backups/` gesichert |
+| Alte Releases | Über `KEEP_RELEASES` gesteuert; die aktive Version **und** `current-good` (neu in 1.18) werden nie automatisch gelöscht |
+| DB-Backups | Unter `/etc/oxicloud/db-backups`, über `DB_BACKUP_KEEP` (Standard 10) gesteuert |
+| Zuletzt gesundes Release *(neu in 1.18)* | Symlink `current-good`, wird nur nach erfolgreichem Health-Check aktualisiert — dient als verlässliches automatisches Rollback-Ziel |
 
 ---
 
 ## Sicherheit: Datei-Rechte im Überblick
 
-| Datei | Rechte | Enthält |
+| Datei/Verzeichnis | Rechte | Enthält |
 |---|---|---|
+| `/etc/oxicloud/` *(seit 1.18 explizit)* | `750`, root | Verzeichnis selbst — verbirgt u. a. Dateinamen der DB-Backups vor anderen lokalen Usern |
 | `/etc/oxicloud/.env` | `640`, `root:oxicloud` | `DATABASE_URL`, `OXICLOUD_DB_CONNECTION_STRING`, weitere `.env`-Werte |
 | `/etc/oxicloud/.db_password` | `600`, root | DB-Passwort im Klartext |
-| `/etc/oxicloud/db-backups/*.sql.gz` *(neu in 1.13)* | `600`, root | Vollständiger Datenbank-Dump (potenziell sensible Nutzdaten) |
-| `/etc/systemd/system/oxicloud.service` | `644` (systemd-Standard, für alle lesbar) | **Seit 1.11 kein Passwort mehr** — vorher enthielt es `DATABASE_URL` im Klartext |
+| `/etc/oxicloud/db-backups/*.sql.gz` | `600`, root | Vollständiger Datenbank-Dump (potenziell sensible Nutzdaten) |
+| `/etc/oxicloud/pre-clone-backups/*.tar.gz` *(neu in 1.18)* | Standard (root-Verzeichnis `750`) | Tarball eines evtl. vorbefüllten `OXICLOUD_HOME` vor dem ersten Klonen |
+| `/etc/systemd/system/oxicloud.service` | `644` (systemd-Standard, für alle lesbar) | Seit 1.11 kein Passwort mehr — vorher enthielt es `DATABASE_URL` im Klartext |
 
 ---
 
 ## Versionierte Releases & Rollback
 
-Jede gebaute Binary landet unter `${OXICLOUD_HOME}/releases/oxicloud-<git-hash>`,
-`current` ist ein Symlink darauf.
+Jede gebaute Binary landet unter `${OXICLOUD_HOME}/releases/oxicloud-<git-hash>`.
+Es gibt zwei Symlinks:
 
-**Automatisch (seit 1.13):** Antwortet der Dienst nach einem Rebuild nicht
-innerhalb von `HEALTH_RETRIES` × 2 Sekunden auf
-`http://127.0.0.1:${OXICLOUD_PORT}/`, rollt das Script selbstständig auf
-das zuletzt funktionierende Release zurück und startet den Dienst damit
-neu (siehe „Neuerungen in 1.13", Punkt 1). Das Script beendet sich in
-diesem Fall trotzdem mit Exit-Code 1, damit der Fehlschlag sichtbar bleibt
-(z. B. für die Webhook-Benachrichtigung oder einen Cron-Job-Status).
+- **`current`** — zeigt immer auf die zuletzt gebaute/aktive Binary.
+- **`current-good`** *(neu in 1.18)* — zeigt auf die Binary, die zuletzt
+  einen Health-Check bestanden hat. Wird ausschließlich nach erfolgreichem
+  Health-Check aktualisiert und dient als verlässliches automatisches
+  Rollback-Ziel — im Unterschied zu vorher, wo schlicht „das zuletzt
+  modifizierte andere Release" gewählt wurde, ohne Garantie, dass dieses
+  selbst je funktioniert hat.
+
+**Automatisch:** Antwortet der Dienst nach einem Rebuild nicht innerhalb
+von `HEALTH_RETRIES` × 2 Sekunden mit einem der `HEALTH_CHECK_EXPECTED_CODES`
+auf `http://127.0.0.1:${OXICLOUD_PORT}${HEALTH_CHECK_PATH}`, rollt das
+Script selbstständig auf `current-good` zurück und startet den Dienst
+damit neu. Das Script beendet sich in diesem Fall trotzdem mit Exit-Code
+1, damit der Fehlschlag sichtbar bleibt (z. B. für die
+Webhook-Benachrichtigung oder einen Cron-Job-Status).
 
 **Manuell** (z. B. um gezielt auf ein älteres, nicht das direkt vorherige
 Release zu wechseln):
@@ -613,9 +811,12 @@ sudo systemctl restart oxicloud
 
 `cargo build --release` mit LTO ist speicherhungrig. Das Script gibt dazu
 eine Einschätzung aus (empfohlen: 4+ CPU-Kerne, 16+ GB RAM, ~20 GB freier
-Speicher) und legt bei zu wenig RAM **automatisch** einen 8-GB-Swapfile an
-(`/swapfile`, dauerhaft in `/etc/fstab` eingetragen) — und entfernt ihn nach
-erfolgreichem Build wieder vollständig, inklusive `/etc/fstab`-Eintrag.
+Speicher) und legt bei zu wenig RAM **und tatsächlich anstehendem
+Rebuild** (seit 1.18, vorher bei jedem Lauf) automatisch einen 8-GB-Swapfile
+an (`/swapfile`, dauerhaft in `/etc/fstab` eingetragen) — und entfernt ihn
+garantiert wieder vollständig, inklusive `/etc/fstab`-Eintrag, egal ob der
+Lauf erfolgreich war oder vorzeitig abgebrochen ist (seit 1.18 über einen
+EXIT-Trap, siehe „Neuerungen in 1.18", Punkt 5).
 
 Seit 1.13 gilt zusätzlich: Sinkt der freie Speicherplatz unter
 `DISK_ABORT_THRESHOLD_GB` (Standard 5 GB), bricht das Script **vor** dem
@@ -630,15 +831,17 @@ mehr RAM bereitstellen, oder den Swapfile-Block im Script deaktivieren.
 ## Versions-Pinning
 
 Standardmäßig läuft alles auf dem jeweils neuesten Stand:
-- OxiCloud: `main`-Branch (seit 1.13 via `git fetch` + `reset --hard
-  origin/main`, siehe „Neuerungen in 1.13", Punkt 4)
+- OxiCloud: `main`-Branch (via `git fetch` + `reset --hard origin/main`)
 - Node.js: neueste LTS-Major-Version
 - Rust: `rustup update stable`
 
 Für reproduzierbare/stabile Deployments können alle drei über
 `OXICLOUD_VERSION_PIN`, `NODE_VERSION_PIN`, `RUST_VERSION_PIN` festgenagelt
-werden. Ein Wechsel eines Pins (z. B. neues `OXICLOUD_VERSION_PIN`) löst
-automatisch einen Rebuild aus, sobald sich dadurch etwas ändert.
+werden. `OXICLOUD_VERSION_PIN="latest"` löst zur Laufzeit gegen das
+neueste GitHub-Release auf (seit 1.18 robust gegen Netzwerkfehler und
+optional mit `GITHUB_TOKEN` gegen Rate-Limits abgesichert). Ein Wechsel
+eines Pins löst automatisch einen Rebuild aus, sobald sich dadurch etwas
+ändert.
 
 ---
 
@@ -663,28 +866,37 @@ automatisierten Läufen nicht unbegrenzt wächst.
 Trat vor allem in minimalen LXC-Containern auf (z. B. offizielle
 Proxmox-Debian-Templates), die `sudo` standardmäßig nicht mitbringen — im
 Gegensatz zu vollwertigen VMs/Images. Seit Version 1.12 installiert der
-Preflight-Check `sudo` automatisch mit, falls es fehlt (siehe „Fix in
-1.12" oben). Bei einer älteren Script-Version: `apt-get install -y sudo`
-manuell ausführen und das Script erneut starten — dank Idempotenz setzt es
-sauber dort fort, wo es abgebrochen war.
+Preflight-Check `sudo` automatisch mit, falls es fehlt. Bei einer älteren
+Script-Version: `apt-get install -y sudo` manuell ausführen und das
+Script erneut starten — dank Idempotenz setzt es sauber dort fort, wo es
+abgebrochen war.
 
 **`error: cannot update the lock file ... because --locked was passed` (behoben seit 1.17):**
 Die eingecheckte `Cargo.lock` passt nicht mehr zur `Cargo.toml` — meist,
 weil Upstream im main-Branch eine Abhängigkeit geändert/hinzugefügt hat,
 ohne die Lockfile neu zu committen. Seit Version 1.17 fängt das Script
 das selbst ab: erzeugt bei diesem Fehler einmalig eine neue Lockfile
-(`cargo generate-lockfile`) und wiederholt den Build genau einmal (siehe
-„Neuerung in 1.17" oben). Bei einer älteren Script-Version manuell:
+(`cargo generate-lockfile`) und wiederholt den Build genau einmal. Bei
+einer älteren Script-Version manuell:
 `cd /opt/oxicloud && sudo -u oxicloud bash -c "source .cargo/env && cargo generate-lockfile"`,
 danach das Script erneut ausführen.
 
+**„Konnte neuestes GitHub-Release nicht ermitteln" bei `OXICLOUD_VERSION_PIN=latest` (Fehlermeldung jetzt erreichbar seit 1.18):**
+Vor 1.18 hätte ein fehlschlagender GitHub-Abruf an dieser Stelle das
+gesamte Script durch einen `set -e`-Fallstrick still beendet, ohne dass
+diese Meldung je erschienen wäre. Seit 1.18 wird der Fehler korrekt
+abgefangen und ausgegeben. Ursache meist: kein Internet, GitHub nicht
+erreichbar, oder das anonyme Rate-Limit ist erreicht — in letzterem Fall
+hilft, `GITHUB_TOKEN` im Konfigurationsblock zu setzen.
+
 **Build bricht mit `signal: 9, SIGKILL` ab:**
 Fast immer OOM (zu wenig RAM). Das Script versucht das per Auto-Swapfile
-abzufangen, aber bei sehr kleinen VMs (z. B. 1–2 GB RAM) kann selbst das
-nicht reichen — mehr RAM bereitstellen oder auf das Prebuilt-Tooling
-umsteigen (Build auf einer stärkeren separaten Maschine).
+abzufangen (seit 1.18 nur, wenn tatsächlich ein Rebuild ansteht), aber
+bei sehr kleinen VMs (z. B. 1–2 GB RAM) kann selbst das nicht reichen —
+mehr RAM bereitstellen oder auf das Prebuilt-Tooling umsteigen (Build auf
+einer stärkeren separaten Maschine).
 
-**Script bricht mit „Nur noch ca. X GB frei ... Breche vor dem Build ab" ab (neu in 1.13):**
+**Script bricht mit „Nur noch ca. X GB frei ... Breche vor dem Build ab" ab:**
 Kein Fehler, sondern beabsichtigt: weniger als `DISK_ABORT_THRESHOLD_GB`
 (Standard 5 GB) frei unter `${OXICLOUD_HOME%/*}`. Zuerst Speicherplatz
 freigeben — Kandidaten laut Fehlermeldung: alte Releases unter
@@ -692,18 +904,23 @@ freigeben — Kandidaten laut Fehlermeldung: alte Releases unter
 `/etc/oxicloud/db-backups` (über `DB_BACKUP_KEEP` steuerbar),
 `apt-get clean` — dann erneut ausführen.
 
-**„Dienst antwortet nach 10 Versuchen (je 2s) nicht ... Rolle automatisch zurück auf vorheriges Release" (neu in 1.13):**
+**„Dienst antwortet nach 10 Versuchen (je 2s) nicht ... Rolle automatisch zurück auf zuletzt gesundes Release":**
 Der Health-Check nach einem Rebuild ist fehlgeschlagen, das Script hat
-automatisch auf das vorherige, zuletzt funktionierende Release
-zurückgerollt (siehe „Neuerungen in 1.13", Punkt 1, und „Versionierte
+automatisch auf `current-good` zurückgerollt (siehe „Versionierte
 Releases & Rollback" oben). Ursache im **neuen** Release liegt meist an
 einem Laufzeitfehler oder einer fehlgeschlagenen Migration — dazu die
 mitausgegebenen letzten 50 Zeilen aus `journalctl -u oxicloud` prüfen,
 bzw. erneut per `journalctl -u oxicloud -n 100 --no-pager` nachsehen.
 Erst nach Behebung der Ursache erneut versuchen; bis dahin läuft der
-Dienst stabil mit dem zurückgerollten, vorherigen Release weiter.
+Dienst stabil mit dem zurückgerollten Release weiter.
 
-**„Überspringe automatischen Health-Check: ENV_OVERRIDE_SERVER_HOST ist auf ... gesetzt" (neu in 1.15):**
+**„Kein 'current-good'-Release vorhanden ... kein Rollback-Ziel" (Meldung angepasst seit 1.18):**
+Es gibt noch kein Release, das je einen Health-Check bestanden hat — z. B.
+bei der Erstinstallation. In diesem Fall ist manueller Eingriff nötig,
+`systemctl status oxicloud` und `journalctl -u oxicloud -n 100 --no-pager`
+prüfen.
+
+**„Überspringe automatischen Health-Check: ENV_OVERRIDE_SERVER_HOST ist auf ... gesetzt":**
 Kein Fehler: `ENV_OVERRIDE_SERVER_HOST` ist auf eine feste, nicht-lokale
 Adresse gesetzt (nicht leer, nicht `0.0.0.0`/`::`), der Dienst lauscht dort
 also nicht auf `127.0.0.1`. Der Check würde in diesem Fall immer
@@ -711,22 +928,21 @@ fälschlich fehlschlagen, deshalb wird er bewusst übersprungen. Bitte
 manuell prüfen: `systemctl status oxicloud` und ggf. `curl` direkt gegen
 die konfigurierte Adresse.
 
-**„ACHTUNG: Auch das vorherige Release startet nicht sauber. Manueller Eingriff nötig!" (neu in 1.13):**
-Sowohl das neue als auch das automatisch zurückgerollte vorherige Release
-starten nicht sauber — deutet meist auf ein externes Problem hin, das
-nicht am Release selbst liegt (z. B. PostgreSQL down, `.env` fehlerhaft,
-Port bereits belegt). `systemctl status oxicloud` und
+**„ACHTUNG: Auch das zuletzt gesunde Release startet jetzt nicht mehr sauber. Manueller Eingriff nötig!":**
+Sowohl das neue als auch das automatisch zurückgerollte `current-good`-
+Release starten nicht sauber — deutet meist auf ein externes Problem hin,
+das nicht am Release selbst liegt (z. B. PostgreSQL down, `.env`
+fehlerhaft, Port bereits belegt). `systemctl status oxicloud` und
 `journalctl -u oxicloud -n 100 --no-pager` prüfen, Ursache beheben, dann
 manuell `systemctl restart oxicloud`.
 
 **Kein DB-Backup gefunden, obwohl ein Lauf durchgelaufen ist:**
 Backups landen unter `/etc/oxicloud/db-backups/${DB_NAME}-<timestamp>.sql.gz`.
 Prüfen, ob genug Diskspace für `pg_dump` vorhanden war — schlägt das
-Backup fehl, bricht das Script bewusst **vor** der Migration ab (siehe
-„Neuerungen in 1.13", Punkt 2), es gäbe also ohnehin keinen weitergehenden
-Lauf ohne Backup.
+Backup fehl, bricht das Script bewusst **vor** der Migration ab, es gäbe
+also ohnehin keinen weitergehenden Lauf ohne Backup.
 
-**Webhook-Benachrichtigung kommt nicht an (neu in 1.13):**
+**Webhook-Benachrichtigung kommt nicht an:**
 `NOTIFY_WEBHOOK_URL` muss gesetzt und vom Zielserver aus erreichbar sein
 (ausgehender Zugriff, ggf. Firewall/Proxy). Die Benachrichtigung selbst
 ist bewusst fehlertolerant (`curl ... || true`, 10s Timeout) und wird
@@ -735,6 +951,13 @@ niemals selbst laut fehlschlagen — im Zweifel manuell testen:
 curl -fsS -m 10 -X POST -H "Content-Type: application/json" \
   -d '{"text":"Testnachricht"}' "<eure NOTIFY_WEBHOOK_URL>"
 ```
+
+**Firewall-Hinweis erscheint, obwohl ufw inaktiv ist (behoben seit 1.18):**
+Vorher wurde bei `ENV_OVERRIDE_SERVER_HOST=0.0.0.0`/`::` und installiertem,
+aber **inaktivem** ufw fälschlich vor einem angeblich nicht freigegebenen
+Port gewarnt — inaktives ufw blockiert aber ohnehin nichts. Seit 1.18
+prüft das Script zuerst den ufw-Status und gibt bei inaktivem ufw
+stattdessen einen allgemeineren, korrekten Hinweis aus.
 
 **„Ein anderer Lauf dieses Scripts ist bereits aktiv":**
 `flock` auf `/var/run/oxicloud-install.lock` verhindert parallele Läufe
@@ -752,16 +975,13 @@ mit identischem Release-Stand. Siehe Kommentar direkt über `REPO_URL` im
 Script — einmal selbst verifizieren, welcher Remote für euch verbindlich
 sein soll.
 
-**„Konnte aktuelle Node.js-Version nicht ermitteln, falle zurück auf Node 24" (neu sichtbar seit 1.11):**
+**„Konnte aktuelle Node.js-Version nicht ermitteln, falle zurück auf Node 24":**
 Normales, beabsichtigtes Verhalten bei Netzwerkproblemen zu nodejs.org.
-Vor 1.11 hätte genau dieser Fall das Script stattdessen stillschweigend
-komplett beendet, ohne dass diese Meldung je erschienen wäre — sie war
-zwar im Code vorgesehen, aber durch den `set -e`-Fallstrick unerreichbar.
 Kein Handlungsbedarf, außer eine bestimmte Node-Version wird zwingend
 benötigt (`NODE_VERSION_PIN` setzen).
 
 **„Verbindung zur Datenbank ... schlägt fehl, obwohl Rolle/Datenbank/
-Passwort gerade eben gesetzt wurden" (neu in 1.11):**
+Passwort gerade eben gesetzt wurden":**
 Meist eine `pg_hba.conf`-Authentifizierungsmethode, die kein
 Passwort-Login für `localhost` erlaubt (z. B. `peer` statt `md5`/
 `scram-sha-256`). Prüfen:
@@ -770,6 +990,11 @@ cat /etc/postgresql/*/main/pg_hba.conf | grep -v '^#'
 ```
 Zeile für `host ... 127.0.0.1/32 ...` bzw. `local` auf `md5` oder
 `scram-sha-256` umstellen, danach `systemctl restart postgresql`.
+
+**Möchte einen Lauf vorab testen, ohne das System zu verändern:**
+`DRY_RUN=true` im Konfigurationsblock setzen (neu in 1.18) und das Script
+normal ausführen — siehe Abschnitt „Aufruf" und „Neuerungen in 1.18",
+Punkt 13.
 
 ---
 
