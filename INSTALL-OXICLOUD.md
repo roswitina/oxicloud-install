@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.18
+Version: 1.19
 Lizenz: MIT
 
 ---
@@ -24,7 +24,8 @@ Lizenz: MIT
 | 1.15 | Health-Check-Skip bei fester `ENV_OVERRIDE_SERVER_HOST`; Health-Check auch bei Erstinstallation; Rollback-Status in Webhook-Meldung; `chown -R` nur bei Bedarf |
 | 1.16 | Optionale Selbstprüfung auf neuere Script-Version gegen GitHub (`CHECK_FOR_UPDATES`) |
 | 1.17 | Selbstheilung bei fehlschlagendem `cargo build --release --locked` (Cargo.lock-Konflikt) |
-| **1.18** | **Review-Runde mit 13 Fixes/Verbesserungen**, siehe Abschnitt „Neuerungen in 1.18" unten: u. a. abgesicherte `latest`-Release-Ermittlung, vorgezogene Dependency-Verifizierung, optionales `GITHUB_TOKEN`, bedarfsgesteuerter + garantiert aufgeräumter Swapfile, neuer `current-good`-Rollback-Anker, tolerantere Health-Check-Codes, korrigierte ufw-Prüfung, Backup vor destruktivem Directory-Cleanup, sed-Escaping in `set_env_var()`, restriktivere Rechte auf `/etc/oxicloud`, robuste Diskspace-Ermittlung und neuer `DRY_RUN`-Modus |
+| 1.18 | Review-Runde mit 13 Fixes/Verbesserungen, siehe Abschnitt „Neuerungen in 1.18" unten: u. a. abgesicherte `latest`-Release-Ermittlung, vorgezogene Dependency-Verifizierung, optionales `GITHUB_TOKEN`, bedarfsgesteuerter + garantiert aufgeräumter Swapfile, neuer `current-good`-Rollback-Anker, tolerantere Health-Check-Codes, korrigierte ufw-Prüfung, Backup vor destruktivem Directory-Cleanup, sed-Escaping in `set_env_var()`, restriktivere Rechte auf `/etc/oxicloud`, robuste Diskspace-Ermittlung und neuer `DRY_RUN`-Modus |
+| **1.19** | **Der Hinweis auf eine neuere Script-Version erscheint jetzt zusätzlich im finalen Zusammenfassungsblock** statt nur mitten im scrollenden Lauf-Output, siehe Abschnitt „Neuerung in 1.19" unten — bleibt dafür seit dieser Version auch über den Update-Check-Cache hinweg sichtbar |
 
 ---
 
@@ -44,7 +45,66 @@ Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
 
 ---
 
-## Neuerungen in 1.18
+## Neuerung in 1.19
+
+### Update-Hinweis erscheint jetzt zusätzlich im finalen Zusammenfassungsblock
+
+Der Hinweis auf eine neuere Script-Version (siehe „Neuerung in 1.16")
+stand bisher nur mitten im scrollenden Lauf-Output, direkt nach dem
+Preflight-Check:
+
+```
+==> Verifiziere, dass die Basis-Programme tatsächlich verfügbar sind...
+    Basis-Abhängigkeiten sind vorhanden (...).
+
+Hinweis: Auf GitHub liegt eine andere Version von install-oxicloud.sh
+         (lokal: 1.17, dort auf 'main': 1.18).
+         https://github.com/roswitina/oxicloud-install
+
+==> Node.js-Version ist festgenagelt auf ...
+```
+
+Bei einem normalen, mehrere Minuten dauernden Durchlauf (Node/Rust-Update,
+Build, Migration, ...) scrollt diese Zeile schnell aus dem sichtbaren
+Bereich heraus. Im finalen Zusammenfassungsblock am Scriptende — dem Teil,
+den man tatsächlich anschaut, weil dort URL, aktives Release,
+DB-Passwort etc. stehen — tauchte der Hinweis bisher nicht mehr auf. Ohne
+konkreten Anlass, extra ins Install-Log zu schauen, ging er damit leicht
+unter (siehe die entsprechende Rückfrage weiter oben in diesem Gespräch).
+
+Der Hinweis erscheint jetzt **zusätzlich** direkt vor dem Ende der
+Zusammenfassung:
+
+```
+======================================================================
+ OxiCloud wurde installiert und gestartet.
+ ...
+ Logs (Installation): /var/log/oxicloud-install.log
+======================================================================
+
+Hinweis: Für install-oxicloud.sh liegt auf GitHub eine andere Version vor
+         (lokal: 1.17, dort auf 'main': 1.18).
+         https://github.com/roswitina/oxicloud-install
+```
+
+**Wichtig, damit das auch an Tagen funktioniert, an denen gar nicht
+tatsächlich geprüft wird:** Der eigentliche GitHub-Abruf läuft weiterhin
+höchstens alle `UPDATE_CHECK_INTERVAL_HOURS` (Standard 24, siehe „Neuerung
+in 1.16"). Damit der Hinweis in der Zusammenfassung nicht nur an dem einen
+Tag erscheint, an dem der Abruf tatsächlich stattfand, speichert die
+Cache-Datei `/etc/oxicloud/.update-check-install-oxicloud` jetzt in einer
+zweiten Zeile zusätzlich die zuletzt bekannte Remote-Version (Zeile 1 =
+Zeitstempel, unverändertes Format). Wurde der Abruf in einem Lauf wegen
+des Intervalls übersprungen, aber der letzte tatsächliche Check hatte
+schon eine neuere Version gefunden, erscheint der Hinweis trotzdem — bis
+entweder lokal aktualisiert wird oder ein neuer echter Check dieselbe
+(dann aktuelle) Version bestätigt und den Cache-Eintrag überschreibt.
+
+Kein Verhalten ändert sich, wenn `CHECK_FOR_UPDATES=false` gesetzt ist
+oder ohnehin keine neuere Version gefunden wird — die zusätzliche Zeile
+im Abschlussblock erscheint nur, wenn es tatsächlich etwas zu melden gibt.
+
+---
 
 Dreizehn Verbesserungen aus einer weiteren Review-Runde — drei davon
 echte Bugfixes, der Rest Härtung und ein neuer Simulationsmodus.
@@ -263,7 +323,13 @@ Wichtig, was das **nicht** tut:
 - **Kein Spam bei häufigen/automatisierten Läufen.** Der tatsächliche
   GitHub-Abruf erfolgt höchstens alle `UPDATE_CHECK_INTERVAL_HOURS`
   (Standard 24) - der Zeitpunkt des letzten Checks wird in
-  `/etc/oxicloud/.update-check-install-oxicloud` gecacht.
+  `/etc/oxicloud/.update-check-install-oxicloud` gecacht (seit 1.19
+  zusätzlich mit der zuletzt gefundenen Remote-Version in Zeile 2, siehe
+  „Neuerung in 1.19").
+
+Seit 1.19 erscheint der Hinweis zusätzlich am Ende im Zusammenfassungsblock
+erneut (siehe „Neuerung in 1.19") — die grundsätzliche Logik hier (Cache,
+Fehlertoleranz, kein Auto-Update) bleibt davon unverändert.
 
 Per `CHECK_FOR_UPDATES=false` komplett abschaltbar (z. B. auf Servern ohne
 Internetzugang zu GitHub); `UPDATE_CHECK_REPO`/`UPDATE_CHECK_BRANCH` sind
@@ -689,7 +755,11 @@ hinzugekommenen.
    bereits hart ab. **Seit 1.18** folgt direkt danach die Verifizierung,
    dass `git`/`curl`/`jq`/`openssl`/`psql` tatsächlich verfügbar sind —
    vorher lief dieser Check erst kurz vor dem Build, also nach DB-Backup
-   und Migration (siehe „Neuerungen in 1.18", Punkt 2).
+   und Migration (siehe „Neuerungen in 1.18", Punkt 2). Unmittelbar danach
+   läuft der Update-Check (siehe „Neuerung in 1.16"); das Ergebnis wird
+   seit 1.19 in `UPDATE_AVAILABLE_VERSION` gemerkt, damit es am Ende auch
+   in der Zusammenfassung wiederholt werden kann (siehe „Neuerung in
+   1.19").
 2. **Node.js & Rust**: werden installiert bzw. aktualisiert (oder auf die
    gepinnte Version gebracht, falls `NODE_VERSION_PIN`/`RUST_VERSION_PIN`
    gesetzt sind). Ein Versionswechsel bei einem der beiden löst automatisch
@@ -745,6 +815,11 @@ hinzugekommenen.
    Bei jedem Fehlschlag des gesamten Laufs (Exit-Code ≠ 0) wird, falls
    `NOTIFY_WEBHOOK_URL` gesetzt ist, zusätzlich eine Benachrichtigung
    verschickt, inklusive Rollback-Status im Text.
+10. **Zusammenfassungsblock**: URL, aktives Release, `current-good`,
+    DB-Passwort und weitere Eckdaten des Laufs. **Seit 1.19** erscheint
+    hier zusätzlich der Update-Hinweis aus Schritt 1 erneut, falls
+    `UPDATE_AVAILABLE_VERSION` gesetzt ist (siehe „Neuerung in 1.19") —
+    vorher stand er nur einmalig weiter oben im scrollenden Output.
 
 ---
 
@@ -888,6 +963,15 @@ diese Meldung je erschienen wäre. Seit 1.18 wird der Fehler korrekt
 abgefangen und ausgegeben. Ursache meist: kein Internet, GitHub nicht
 erreichbar, oder das anonyme Rate-Limit ist erreicht — in letzterem Fall
 hilft, `GITHUB_TOKEN` im Konfigurationsblock zu setzen.
+
+**Update-Hinweis erscheint zweimal im Output (kein Fehler, seit 1.19 beabsichtigt):**
+Findet der Update-Check eine neuere Version, erscheint der Hinweis
+inzwischen bewusst **zweimal** — einmal direkt nach dem Preflight-Check
+(wie schon seit 1.16) und ein zweites Mal am Ende im Zusammenfassungsblock
+(neu in 1.19, siehe „Neuerung in 1.19"). Das ist kein Duplikat-Bug, sondern
+der Grund für die 1.19-Änderung: die erste Ausgabe scrollt bei einem
+längeren Lauf schnell aus dem Sichtbereich, die zweite im Abschlussblock
+soll sie zuverlässig sichtbar halten.
 
 **Build bricht mit `signal: 9, SIGKILL` ab:**
 Fast immer OOM (zu wenig RAM). Das Script versucht das per Auto-Swapfile
