@@ -3,12 +3,28 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.18
+# Version:          1.19
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-08-29 UTC (Review-Runde: Bugfixes + Härtung)
+# Zuletzt geändert: 2026-08-29 UTC (Update-Hinweis auch im Abschlussblock)
 #
 # Changelog:
+#   1.19 - Der Hinweis auf eine neuere Script-Version (CHECK_FOR_UPDATES,
+#          siehe 1.16) stand bisher nur mitten im scrollenden Lauf-Output,
+#          direkt nach dem Preflight-Check. Im finalen Zusammenfassungsblock
+#          am Scriptende - dem Teil, den man beim normalen Durchlauf
+#          tatsächlich anschaut - tauchte er nicht mehr auf und ging damit
+#          leicht unter, ohne dass man Grund hätte, extra ins Install-Log
+#          zu schauen. Der Hinweis wird jetzt zusätzlich am Ende in der
+#          Zusammenfassung wiederholt. Damit das auch dann noch funktioniert,
+#          wenn der eigentliche GitHub-Abruf in diesem Lauf wegen
+#          UPDATE_CHECK_INTERVAL_HOURS übersprungen wurde (Cache greift),
+#          speichert die Cache-Datei jetzt zusätzlich zum Zeitstempel
+#          (weiterhin Zeile 1, unverändertes Format) in Zeile 2 die zuletzt
+#          bekannte Remote-Version - ein an einem Vortag gefundener Hinweis
+#          bleibt so auch an den Tagen sichtbar, an denen selbst nicht neu
+#          geprüft wird, bis entweder lokal aktualisiert wird oder ein
+#          neuer echter Check dieselbe Version bestätigt.
 #   1.18 - Review-Runde mit folgenden Fixes/Verbesserungen:
 #          1) BUGFIX: Ermittlung des "latest"-GitHub-Release
 #             (OXICLOUD_VERSION_PIN=latest) war unter "set -e -o pipefail"
@@ -196,7 +212,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben)
-SCRIPT_VERSION="1.18"
+SCRIPT_VERSION="1.19"
 
 # Simulationsmodus: true = keine echten Änderungen am System, nur Logging.
 # Nützlich um z.B. eine geänderte Konfiguration (ENV_OVERRIDE_*, Pins, ...)
@@ -486,10 +502,26 @@ done
 echo "    Basis-Abhängigkeiten sind vorhanden (Node/npm/cargo werden weiter unten installiert/geprüft)."
 
 # ---- Selbstprüfung auf neuere Script-Version (rein informativ) ------------
+# Fix (1.19): Das Ergebnis dieses Checks stand bisher NUR mitten im
+# scrollenden Lauf-Output - im finalen Zusammenfassungsblock am Scriptende
+# (der Teil, den man tatsächlich anschaut) tauchte es nicht mehr auf und
+# ging damit leicht unter, ohne dass man Grund hätte, extra ins Install-Log
+# zu schauen. UPDATE_AVAILABLE_VERSION hält das Ergebnis jetzt über den
+# Rest des Laufs hinweg fest, damit der Abschlussblock es erneut anzeigen
+# kann. Die Cache-Datei speichert dafür zusätzlich zum Zeitstempel (weiterhin
+# erste Zeile, unverändertes Format für Abwärtskompatibilität mit älteren
+# Läufen) jetzt optional eine zweite Zeile mit der zuletzt bekannten
+# Remote-Version - so lässt sich der Hinweis auch dann noch im
+# Abschlussblock anzeigen, wenn der eigentliche GitHub-Abruf in DIESEM Lauf
+# wegen UPDATE_CHECK_INTERVAL_HOURS übersprungen wurde, der letzte
+# tatsächliche Check (an einem Vortag) aber schon eine neuere Version fand.
+UPDATE_AVAILABLE_VERSION=""
 if [[ "${CHECK_FOR_UPDATES}" == "true" ]] && command -v curl &>/dev/null; then
   DO_UPDATE_CHECK=1
+  CACHED_REMOTE_VERSION=""
   if [[ -f "${UPDATE_CHECK_CACHE}" ]]; then
-    LAST_CHECK_EPOCH="$(cat "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo 0)"
+    LAST_CHECK_EPOCH="$(sed -n '1p' "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo 0)"
+    CACHED_REMOTE_VERSION="$(sed -n '2p' "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo "")"
     NOW_EPOCH="$(date +%s)"
     AGE_HOURS=$(( (NOW_EPOCH - LAST_CHECK_EPOCH) / 3600 ))
     [[ "${AGE_HOURS}" -lt "${UPDATE_CHECK_INTERVAL_HOURS}" ]] && DO_UPDATE_CHECK=0
@@ -501,15 +533,25 @@ if [[ "${CHECK_FOR_UPDATES}" == "true" ]] && command -v curl &>/dev/null; then
     if [[ -n "${REMOTE_RAW_SCRIPT}" ]]; then
       REMOTE_SCRIPT_VERSION="$(printf '%s\n' "${REMOTE_RAW_SCRIPT}" | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
       if [[ -n "${REMOTE_SCRIPT_VERSION}" && "${REMOTE_SCRIPT_VERSION}" != "${SCRIPT_VERSION}" ]]; then
+        UPDATE_AVAILABLE_VERSION="${REMOTE_SCRIPT_VERSION}"
         echo ""
         echo "Hinweis: Auf GitHub liegt eine andere Version von install-oxicloud.sh"
         echo "         (lokal: ${SCRIPT_VERSION}, dort auf '${UPDATE_CHECK_BRANCH}': ${REMOTE_SCRIPT_VERSION})."
         echo "         https://github.com/${UPDATE_CHECK_REPO}"
+        echo "         (Dieser Hinweis erscheint am Ende auch nochmal in der Zusammenfassung.)"
         echo ""
       fi
     fi
     mkdir -p "$(dirname "${UPDATE_CHECK_CACHE}")" 2>/dev/null || true
-    date +%s > "${UPDATE_CHECK_CACHE}" 2>/dev/null || true
+    { date +%s; echo "${UPDATE_AVAILABLE_VERSION}"; } > "${UPDATE_CHECK_CACHE}" 2>/dev/null || true
+  elif [[ -n "${CACHED_REMOTE_VERSION}" && "${CACHED_REMOTE_VERSION}" != "${SCRIPT_VERSION}" ]]; then
+    # Check heute schon gelaufen (Cache greift), letzter tatsächlicher Check
+    # hatte aber eine neuere Version gefunden - Hinweis bleibt sichtbar,
+    # bis entweder das Script aktualisiert wird oder ein neuer echter Check
+    # dieselbe Version bestätigt (dann wird der Cache-Eintrag oben beim
+    # nächsten echten Check ohnehin durch die aktuelle Remote-Version
+    # überschrieben).
+    UPDATE_AVAILABLE_VERSION="${CACHED_REMOTE_VERSION}"
   fi
 fi
 
@@ -1232,6 +1274,20 @@ echo " Service-Status:    systemctl status oxicloud"
 echo " Logs (Service):    journalctl -u oxicloud -f"
 echo " Logs (Installation): ${LOG_FILE}"
 echo "======================================================================"
+
+# Fix (1.19): Der Hinweis auf eine neuere Script-Version stand bisher nur
+# mitten im scrollenden Lauf-Output (direkt nach dem Preflight-Check) - im
+# Zusammenfassungsblock, den man beim normalen Durchlauf tatsächlich liest,
+# tauchte er nicht mehr auf und wurde dadurch leicht übersehen, ohne dass
+# ein Grund bestünde, extra ins Install-Log zu schauen. Erscheint hier
+# erneut, falls beim Update-Check (oben, ggf. aus dem Cache übernommen)
+# eine abweichende Version gefunden wurde.
+if [[ -n "${UPDATE_AVAILABLE_VERSION}" ]]; then
+  echo ""
+  echo "Hinweis: Für install-oxicloud.sh liegt auf GitHub eine andere Version vor"
+  echo "         (lokal: ${SCRIPT_VERSION}, dort auf '${UPDATE_CHECK_BRANCH}': ${UPDATE_AVAILABLE_VERSION})."
+  echo "         https://github.com/${UPDATE_CHECK_REPO}"
+fi
 
 if [[ "${NEED_BUILD}" -eq 1 && "${DRY_RUN}" != "true" ]]; then
   echo ""
