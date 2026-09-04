@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.19
+Version: 1.20
 Lizenz: MIT
 
 ---
@@ -25,7 +25,8 @@ Lizenz: MIT
 | 1.16 | Optionale Selbstprüfung auf neuere Script-Version gegen GitHub (`CHECK_FOR_UPDATES`) |
 | 1.17 | Selbstheilung bei fehlschlagendem `cargo build --release --locked` (Cargo.lock-Konflikt) |
 | 1.18 | Review-Runde mit 13 Fixes/Verbesserungen, siehe Abschnitt „Neuerungen in 1.18" unten: u. a. abgesicherte `latest`-Release-Ermittlung, vorgezogene Dependency-Verifizierung, optionales `GITHUB_TOKEN`, bedarfsgesteuerter + garantiert aufgeräumter Swapfile, neuer `current-good`-Rollback-Anker, tolerantere Health-Check-Codes, korrigierte ufw-Prüfung, Backup vor destruktivem Directory-Cleanup, sed-Escaping in `set_env_var()`, restriktivere Rechte auf `/etc/oxicloud`, robuste Diskspace-Ermittlung und neuer `DRY_RUN`-Modus |
-| **1.19** | **Der Hinweis auf eine neuere Script-Version erscheint jetzt zusätzlich im finalen Zusammenfassungsblock** statt nur mitten im scrollenden Lauf-Output, siehe Abschnitt „Neuerung in 1.19" unten — bleibt dafür seit dieser Version auch über den Update-Check-Cache hinweg sichtbar |
+| 1.19 | Der Hinweis auf eine neuere Script-Version erscheint zusätzlich im finalen Zusammenfassungsblock statt nur mitten im scrollenden Lauf-Output, siehe Abschnitt „Neuerung in 1.19" unten — bleibt dafür seit dieser Version auch über den Update-Check-Cache hinweg sichtbar |
+| **1.20** | **Neuer, standardmäßig deaktivierter Schalter `AUTO_REPAIR_MODIFIED_MIGRATIONS`** für den Fall „migration X was previously applied but has been modified" (sqlx-Checksummen-Mismatch bei ungepinntem main-Branch), siehe Abschnitt „Neuerung in 1.20" unten |
 
 ---
 
@@ -42,6 +43,93 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerung in 1.20
+
+### Umgang mit nachträglich geänderten, bereits angewendeten Migrationen
+
+Da dieses Script standardmäßig ungepinnt dem `main`-Branch folgt (siehe
+`OXICLOUD_VERSION_PIN`), kann es vorkommen, dass Upstream eine Migration
+nachträglich ändert, die bei euch **bereits erfolgreich angewendet**
+wurde — z. B. ein reiner Performance-Rewrite einer als idempotent
+nachgewiesenen Migration. `cargo sqlx migrate run` bricht in diesem Fall
+absichtlich ab:
+
+```
+error: migration 20261017000002 was previously applied but has been modified
+```
+
+Das ist **kein Bug**, sondern der eingebaute Schutzmechanismus von sqlx
+gegen unbemerkt veränderte Migrationshistorien — ob eine geänderte
+Migration wirklich nur ein harmloser Rewrite war oder tatsächlich die
+Semantik geändert hat, lässt sich nicht automatisch beurteilen. Das
+Script hat diesen Fehler bisher unverändert durchgereicht: Abbruch,
+manuelle Prüfung und ggf. manuelles Löschen des Tracking-Eintrags nötig.
+
+Neu ist der Konfigurationsschalter `AUTO_REPAIR_MODIFIED_MIGRATIONS`
+(Standard `false`):
+
+- **`false` (Standard, unverändertes Verhalten):** Das Script erkennt den
+  Fall, gibt eine ausführliche Warnung mit der betroffenen
+  Migrationsversion und einer konkreten Handlungsanweisung aus und
+  bricht dann wie bisher ab:
+
+  ```
+  WARNUNG: Migration 20261017000002 wurde bereits angewendet, ihr Inhalt
+  wurde seitdem aber geändert (sqlx-Checksummen-Mismatch). Das passiert, weil
+  dieser Lauf ungepinnt dem main-Branch folgt (OXICLOUD_VERSION_PIN="") und
+  Upstream eine bereits ausgelieferte Migration nachträglich umgeschrieben hat.
+  Empfehlung: OXICLOUD_VERSION_PIN im Konfigurationsblock auf einen festen
+  Release-Tag setzen, damit das künftig nicht mehr passiert.
+
+  AUTO_REPAIR_MODIFIED_MIGRATIONS ist false (Standard): kein automatischer
+  Eingriff. Bitte manuell prüfen, ob die Änderung an der Migrationsdatei
+  tatsächlich nur ein sicherer/idempotenter Rewrite ist (Diff der Migration
+  gegen den vorherigen Stand ansehen), dann ggf. von Hand beheben mit:
+    sudo -u postgres psql -d 'oxicloud' \
+      -c "DELETE FROM _sqlx_migrations WHERE version = 20261017000002;"
+  und das Script erneut ausführen. Alternativ AUTO_REPAIR_MODIFIED_MIGRATIONS=true
+  setzen, falls dieser Fall künftig automatisch behoben werden soll.
+  ```
+
+- **`true`:** Das Script parst die betroffene Migrationsversion
+  automatisch aus der sqlx-Fehlermeldung, löscht **gezielt nur ihren**
+  Eintrag in `_sqlx_migrations` und führt `cargo sqlx migrate run`
+  danach einmal automatisch erneut aus — die Migration läuft dann mit
+  ihrem neuen Inhalt. Das ohnehin schon vor jeder Migration angelegte
+  DB-Backup (siehe `DB_BACKUP_KEEP`) existiert zu diesem Zeitpunkt
+  bereits und dient dabei als Absicherung nach unten.
+
+Wichtig, was **unverändert** bleibt:
+
+- Jede **andere** Art von Migrationsfehler (z. B. ein echter SQL-Fehler in
+  einer neuen Migration) wird weiterhin unverändert durchgereicht — das
+  Script bricht wie bisher mit dem ursprünglichen Exit-Code ab, unabhängig
+  vom Stand von `AUTO_REPAIR_MODIFIED_MIGRATIONS`.
+- `AUTO_REPAIR_MODIFIED_MIGRATIONS=true` behebt nur das **Symptom**. Der
+  eigentlich robustere Weg gegen dieses Szenario bleibt,
+  `OXICLOUD_VERSION_PIN` auf einen festen Release-Tag zu setzen — Upstream
+  ändert Migrationen in bereits veröffentlichten Tags praktisch nie mehr
+  nachträglich. Die Warnmeldung empfiehlt das deshalb unabhängig davon,
+  wie `AUTO_REPAIR_MODIFIED_MIGRATIONS` gesetzt ist.
+- `AUTO_REPAIR_MODIFIED_MIGRATIONS` hat außerhalb dieses einen Fehlerbilds
+  keinerlei Effekt — bei erfolgreicher Migration oder einem anderen Fehler
+  ändert sich am Ablauf nichts.
+
+**Wann `true` sinnvoll ist:** Nur, wenn ihr bewusst darauf vertraut, dass
+nachträgliche Änderungen von Upstream an bereits angewendeten Migrationen
+bei diesem Projekt ausschließlich sichere/idempotente Rewrites sind (z. B.
+reine Performance-Optimierungen ohne Semantikänderung) — z. B. für
+unbeaufsichtigte Cron-Läufe, bei denen ein Abbruch mangels manueller
+Prüfung ohnehin nur zu einem veralteten, aber laufenden Dienst führen
+würde. Für produktive Instanzen mit hohen Anforderungen an Nachvollziehbarkeit
+ist `OXICLOUD_VERSION_PIN` auf einen festen Tag in Kombination mit dem
+Standardverhalten (`false`) der robustere Ansatz.
+
+Der Zusammenfassungsblock am Scriptende zeigt seit 1.20 zusätzlich an, ob
+`AUTO_REPAIR_MODIFIED_MIGRATIONS` aktiviert ist.
 
 ---
 
@@ -419,7 +507,8 @@ Zusätzlich wurden `DISK_ABORT_THRESHOLD_GB`, `DB_BACKUP_KEEP` und
 aus ihren bisherigen Positionen direkt über der jeweiligen Codestelle in
 den zentralen Konfigurationsblock am Scriptanfang verschoben — seit 1.18
 gilt das ebenso für alle neuen Variablen (`GITHUB_TOKEN`, `DRY_RUN`,
-`HEALTH_CHECK_PATH`, `HEALTH_CHECK_EXPECTED_CODES`).
+`HEALTH_CHECK_PATH`, `HEALTH_CHECK_EXPECTED_CODES`), seit 1.20 auch für
+`AUTO_REPAIR_MODIFIED_MIGRATIONS`.
 
 ---
 
@@ -470,7 +559,9 @@ sudo -u postgres pg_dump "${DB_NAME}" | gzip > /etc/oxicloud/db-backups/oxicloud
 mit `chmod 600` und automatischer Bereinigung auf die letzten
 `DB_BACKUP_KEEP` Stände (Standard 10). Schlägt das Backup selbst fehl,
 bricht das Script **vor** der Migration ab, statt eine potenziell
-riskante Migration ohne Sicherheitsnetz laufen zu lassen.
+riskante Migration ohne Sicherheitsnetz laufen zu lassen. Seit 1.20 dient
+dieses Backup zusätzlich als Absicherung für den optionalen
+`AUTO_REPAIR_MODIFIED_MIGRATIONS`-Mechanismus (siehe „Neuerung in 1.20").
 
 ### 3. Log-Rotation für das Install-Log
 
@@ -491,7 +582,10 @@ origin/main` erzwingt stattdessen immer exakt den Stand von
 `origin/main`, unabhängig von der lokalen Historie. Betrifft nur den
 Fall, dass kein `OXICLOUD_VERSION_PIN` gesetzt ist (also dem
 `main`-Branch gefolgt wird) — bei einem festen Tag/Release lief es schon
-vorher über `git checkout`.
+vorher über `git checkout`. Genau dieses ungepinnte main-Tracking ist
+auch die Voraussetzung dafür, dass der in 1.20 behandelte Fall
+(nachträglich geänderte, bereits angewendete Migration) überhaupt
+auftreten kann.
 
 ### 5. Harter Abbruch bei kritisch wenig Diskspace
 
@@ -719,11 +813,12 @@ Schritte werden mit `[DRY_RUN]`-Präfix geloggt, aber nicht ausgeführt
 | `RUST_VERSION_PIN` | leer | Leer = immer `rustup update stable`; sonst z. B. `"1.82.0"` |
 | `ENV_OVERRIDE_SERVER_HOST` | leer | Überschreibt `OXICLOUD_SERVER_HOST` in der `.env`, z. B. `"0.0.0.0"` — mit Firewall-Hinweis bei `0.0.0.0`/`::` (seit 1.18 nur bei aktivem ufw, siehe oben) |
 | `ENV_OVERRIDE_BASE_URL` | leer | Überschreibt `OXICLOUD_BASE_URL` in der `.env`, z. B. `"https://cloud.example.com"` — Sonderzeichen werden seit 1.18 korrekt escaped |
-| `OXICLOUD_VERSION_PIN` | leer | Leer = folgt `main`-Branch; `"latest"` = neuestes GitHub-Release (seit 1.18 robust gegen fehlschlagenden Abruf, siehe oben); `"vX.Y.Z"` = fester Tag |
+| `OXICLOUD_VERSION_PIN` | leer | Leer = folgt `main`-Branch; `"latest"` = neuestes GitHub-Release (seit 1.18 robust gegen fehlschlagenden Abruf, siehe oben); `"vX.Y.Z"` = fester Tag. **Empfehlung:** für produktive Instanzen fest pinnen, damit der in 1.20 behandelte Fall (nachträglich geänderte, bereits angewendete Migration) gar nicht erst auftritt |
 | `ENABLE_PLUGINS` | `false` | `true` baut mit Cargo-Feature `plugins` (WASM-Runtime via Extism) und setzt `OXICLOUD_ENABLE_PLUGINS=true` |
 | `NOTIFY_WEBHOOK_URL` | leer | Leer = keine Benachrichtigung; sonst Slack-/Mattermost-kompatible Webhook-URL, die bei jedem fehlgeschlagenen Lauf (Exit-Code ≠ 0) einen POST mit `{"text": "..."}` erhält |
 | `GENERIC_BACKUP_KEEP` | `10` | Wie viele Zeitstempel-Backups **pro Datei** in den jeweiligen `backups/`-Unterordnern behalten werden (`.env`, systemd-Unit, `/etc/fstab`); `0` = keine Bereinigung |
 | `DB_BACKUP_KEEP` | `10` | Wie viele DB-Backups unter `/etc/oxicloud/db-backups` behalten werden; `0` = keine Bereinigung |
+| `AUTO_REPAIR_MODIFIED_MIGRATIONS` *(neu in 1.20)* | `false` | `true` behebt den Fall „migration X was previously applied but has been modified" automatisch (Tracking-Eintrag löschen + Migration erneut ausführen), statt wie im Standardverhalten abzubrechen — siehe „Neuerung in 1.20" |
 | `DISK_ABORT_THRESHOLD_GB` | `5` | Unterhalb dieser freien GB im Ressourcen-Check bricht das Script vor dem Build hart ab (Ermittlung seit 1.18 robust gegen leere Rückgabe) |
 | `HEALTH_RETRIES` | `10` | Wie oft (im 2-Sekunden-Abstand) der Health-Check nach einem Rebuild versucht wird, bevor ein Rollback ausgelöst wird |
 | `HEALTH_CHECK_PATH` *(neu in 1.18)* | `"/"` | Pfad, gegen den der Health-Check läuft |
@@ -738,7 +833,7 @@ Alle `ENV_OVERRIDE_*`-Variablen greifen nur, wenn nicht leer — leer lassen
 heißt: Standardwert aus `example.env` bleibt unangetastet.
 
 Seit 1.14 stehen **alle** anpassbaren Werte gesammelt im
-Konfigurationsblock am Scriptanfang, inklusive der in 1.18 neu
+Konfigurationsblock am Scriptanfang, inklusive der in 1.18 und 1.20 neu
 hinzugekommenen.
 
 ---
@@ -793,7 +888,14 @@ hinzugekommenen.
    ein `pg_dump`-Backup nach `/etc/oxicloud/db-backups`; schlägt das
    Backup fehl, wird die Migration gar nicht erst versucht. Danach läuft
    `cargo sqlx migrate run` wie bisher bei **jedem** Lauf (idempotent,
-   wendet nur ausstehende Migrationen an).
+   wendet nur ausstehende Migrationen an). **Seit 1.20:** Meldet sqlx dabei
+   „migration X was previously applied but has been modified" (typisch bei
+   ungepinntem main-Branch, siehe „Neuerung in 1.20"), gibt das Script eine
+   ausführliche Warnung samt Handlungsempfehlung aus und bricht standardmäßig
+   ab; nur bei explizit gesetztem `AUTO_REPAIR_MODIFIED_MIGRATIONS=true`
+   wird der betroffene Tracking-Eintrag automatisch entfernt und die
+   Migration einmal automatisch wiederholt. Jeder andere Migrationsfehler
+   wird weiterhin unverändert durchgereicht.
 7. **Rebuild** (nur falls nötig): Frontend (`npm run build`) und Backend
    (`cargo build --release --locked`) werden neu gebaut. Steht ein
    Rebuild an und ist wenig RAM frei, legt das Script vorher **seit
@@ -816,7 +918,8 @@ hinzugekommenen.
    `NOTIFY_WEBHOOK_URL` gesetzt ist, zusätzlich eine Benachrichtigung
    verschickt, inklusive Rollback-Status im Text.
 10. **Zusammenfassungsblock**: URL, aktives Release, `current-good`,
-    DB-Passwort und weitere Eckdaten des Laufs. **Seit 1.19** erscheint
+    DB-Passwort und weitere Eckdaten des Laufs, seit 1.20 zusätzlich der
+    Status von `AUTO_REPAIR_MODIFIED_MIGRATIONS`. **Seit 1.19** erscheint
     hier zusätzlich der Update-Hinweis aus Schritt 1 erneut, falls
     `UPDATE_AVAILABLE_VERSION` gesetzt ist (siehe „Neuerung in 1.19") —
     vorher stand er nur einmalig weiter oben im scrollenden Output.
@@ -833,8 +936,9 @@ hinzugekommenen.
 | `.env`, systemd-Unit, `/etc/fstab` | Vor jedem Überschreiben wird eine Zeitstempel-Kopie in einem `backups/`-Unterordner neben der jeweiligen Datei angelegt — begrenzt auf die neuesten `GENERIC_BACKUP_KEEP` Stände pro Datei |
 | Nicht-leeres, noch nicht geklontes `OXICLOUD_HOME` *(neu in 1.18)* | Wird vor dem Leeren als Tarball unter `/etc/oxicloud/pre-clone-backups/` gesichert |
 | Alte Releases | Über `KEEP_RELEASES` gesteuert; die aktive Version **und** `current-good` (neu in 1.18) werden nie automatisch gelöscht |
-| DB-Backups | Unter `/etc/oxicloud/db-backups`, über `DB_BACKUP_KEEP` (Standard 10) gesteuert |
+| DB-Backups | Unter `/etc/oxicloud/db-backups`, über `DB_BACKUP_KEEP` (Standard 10) gesteuert — dient seit 1.20 zusätzlich als Absicherung für `AUTO_REPAIR_MODIFIED_MIGRATIONS` |
 | Zuletzt gesundes Release *(neu in 1.18)* | Symlink `current-good`, wird nur nach erfolgreichem Health-Check aktualisiert — dient als verlässliches automatisches Rollback-Ziel |
+| sqlx-Migrationshistorie *(neu in 1.20)* | Wird standardmäßig (`AUTO_REPAIR_MODIFIED_MIGRATIONS=false`) nie automatisch verändert — der Checksummen-Schutz von sqlx gegen nachträglich geänderte Migrationen bleibt aktiv, bis ihr bewusst manuell (oder per Opt-in automatisiert) eingreift |
 
 ---
 
@@ -918,6 +1022,13 @@ optional mit `GITHUB_TOKEN` gegen Rate-Limits abgesichert). Ein Wechsel
 eines Pins löst automatisch einen Rebuild aus, sobald sich dadurch etwas
 ändert.
 
+**Zusätzlicher Grund, `OXICLOUD_VERSION_PIN` zu setzen (seit 1.20):** Nur
+beim ungepinnten `main`-Branch kann eine bereits angewendete Migration von
+Upstream nachträglich geändert werden und den in „Neuerung in 1.20"
+beschriebenen sqlx-Checksummen-Mismatch auslösen. Bei einem festen
+Release-Tag tritt dieser Fall praktisch nicht auf, da Upstream Migrationen
+in bereits veröffentlichten Tags nicht mehr nachträglich anfasst.
+
 ---
 
 ## Logs
@@ -936,6 +1047,27 @@ automatisierten Läufen nicht unbegrenzt wächst.
 ---
 
 ## Troubleshooting
+
+**`error: migration X was previously applied but has been modified` (neu behandelt seit 1.20):**
+Tritt nur auf, wenn `OXICLOUD_VERSION_PIN=""` ist (main-Branch wird
+verfolgt) und Upstream eine bereits bei euch angewendete Migration
+nachträglich geändert hat — kein Bug, sondern der Schutzmechanismus von
+sqlx gegen unbemerkt veränderte Migrationshistorien. Das Script erkennt
+den Fall jetzt und gibt eine Warnung mit der genauen Migrationsversion
+sowie einer Handlungsanleitung aus. Standardmäßig
+(`AUTO_REPAIR_MODIFIED_MIGRATIONS=false`) bricht der Lauf danach ab;
+manuell beheben mit:
+```bash
+sudo -u postgres psql -d oxicloud \
+  -c "DELETE FROM _sqlx_migrations WHERE version = <angezeigte Versionsnummer>;"
+```
+und das Script erneut ausführen — vorher aber prüfen, ob die Änderung an
+der Migration tatsächlich nur ein sicherer/idempotenter Rewrite war.
+Alternativ `AUTO_REPAIR_MODIFIED_MIGRATIONS=true` setzen, damit das Script
+das künftig automatisch erledigt (siehe „Neuerung in 1.20" oben zu den
+Voraussetzungen, unter denen das sinnvoll ist). Langfristig empfiehlt sich
+in jedem Fall, `OXICLOUD_VERSION_PIN` auf einen festen Release-Tag zu
+setzen, damit der Fall gar nicht erst auftritt.
 
 **`./install-oxicloud.sh: line N: sudo: command not found` (behoben seit 1.12):**
 Trat vor allem in minimalen LXC-Containern auf (z. B. offizielle
