@@ -3,12 +3,37 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.19
+# Version:          1.20
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-08-29 UTC (Update-Hinweis auch im Abschlussblock)
+# Zuletzt geändert: 2026-09-04 UTC (AUTO_REPAIR_MODIFIED_MIGRATIONS)
 #
 # Changelog:
+#   1.20 - Behandlung von "migration X was previously applied but has been
+#          modified" (sqlx-Checksummen-Mismatch). Tritt auf, weil dieses
+#          Script standardmäßig ungepinnt dem main-Branch folgt und Upstream
+#          gelegentlich eine BEREITS ausgelieferte Migration nachträglich
+#          umschreibt (z.B. reiner Performance-Rewrite bei nachgewiesener
+#          Idempotenz). sqlx bricht in diesem Fall absichtlich ab - das ist
+#          ein Sicherheitsmechanismus und kein Bug, denn ob eine geänderte
+#          Migration wirklich nur ein harmloser Rewrite war oder tatsächlich
+#          die Semantik geändert hat, kann das Script nicht automatisch
+#          beurteilen. Standardverhalten bleibt daher unverändert: Abbruch
+#          mit klarer Fehlermeldung samt Handlungsanweisung. Wer bewusst
+#          entscheidet, dass nachträglich geänderte main-Branch-Migrationen
+#          bei sich automatisch neu angewendet werden sollen (z.B. weil
+#          ohnehin schon vor jeder Migration ein DB-Backup existiert), kann
+#          das jetzt per neuem Schalter AUTO_REPAIR_MODIFIED_MIGRATIONS=true
+#          aktivieren - analog zum bestehenden DRY_RUN-Muster explizit
+#          opt-in, Standard bleibt false. Die dabei jeweils betroffene
+#          Migrationsversion wird aus der sqlx-Fehlermeldung geparst, ihr
+#          Tracking-Eintrag in _sqlx_migrations gelöscht und die Migration
+#          danach einmal erneut ausgeführt. Das eigentlich robustere Mittel
+#          gegen dieses Szenario - OXICLOUD_VERSION_PIN auf einen festen
+#          Release-Tag setzen, da Upstream Migrationen in Tags nicht mehr
+#          nachträglich anfasst - wird in der Warnmeldung weiterhin aktiv
+#          empfohlen, unabhängig davon ob AUTO_REPAIR_MODIFIED_MIGRATIONS
+#          gesetzt ist.
 #   1.19 - Der Hinweis auf eine neuere Script-Version (CHECK_FOR_UPDATES,
 #          siehe 1.16) stand bisher nur mitten im scrollenden Lauf-Output,
 #          direkt nach dem Preflight-Check. Im finalen Zusammenfassungsblock
@@ -175,7 +200,13 @@
 #      festes Release/Tag verwendet werden. Lokale, nicht committete
 #      Änderungen werden vor jedem Pull automatisch als Patch gesichert und
 #      dann verworfen. sqlx-cli wird bei Bedarf installiert; "cargo sqlx
-#      migrate run" wird bei JEDEM Lauf ausgeführt (idempotent).
+#      migrate run" wird bei JEDEM Lauf ausgeführt (idempotent). Wird dabei
+#      eine bereits angewendete, aber nachträglich geänderte Migration
+#      erkannt (sqlx-Checksummen-Mismatch - kann bei ungepinntem main-Branch
+#      vorkommen, falls Upstream eine ausgelieferte Migration nachträglich
+#      umschreibt), bricht das Script standardmäßig mit klarer Anleitung ab;
+#      per AUTO_REPAIR_MODIFIED_MIGRATIONS=true kann das explizit automatisch
+#      behoben werden (siehe Konfigurationsblock).
 #   5. Rebuilds frontend + release binary only if something actually changed.
 #      Jede gebaute Binary wird nach ihrem Git-Commit-Hash versioniert unter
 #      releases/ abgelegt; ein Symlink "current" zeigt auf die jeweils
@@ -212,7 +243,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben)
-SCRIPT_VERSION="1.19"
+SCRIPT_VERSION="1.20"
 
 # Simulationsmodus: true = keine echten Änderungen am System, nur Logging.
 # Nützlich um z.B. eine geänderte Konfiguration (ENV_OVERRIDE_*, Pins, ...)
@@ -245,6 +276,13 @@ ENV_OVERRIDE_BASE_URL=""
 # OxiCloud-Version festnageln (optional). Leer lassen ("") = immer der
 # neueste Stand des main-Branches. "latest" = neuestes GitHub-Release.
 # "vX.Y.Z" = exakt dieser Tag.
+#
+# EMPFEHLUNG: Für produktive Instanzen einen festen Tag setzen (z.B. "latest"
+# oder ein konkretes "vX.Y.Z"). Solange hier "" (main-Branch) steht, kann
+# Upstream jederzeit eine bereits ausgelieferte Migration nachträglich
+# umschreiben - siehe AUTO_REPAIR_MODIFIED_MIGRATIONS weiter unten, was in
+# diesem Fall passiert. Bei einem festen Release-Tag tritt das praktisch
+# nicht auf, da Tags nachträglich nicht mehr verändert werden.
 OXICLOUD_VERSION_PIN=""
 
 # WASM-Plugin-Runtime (Extism) aktivieren. Erfordert das Cargo-Feature
@@ -262,6 +300,38 @@ GENERIC_BACKUP_KEEP=10
 # Wie viele Datenbank-Backups (pg_dump, vor jeder Migration) behalten werden.
 # 0 = keine Bereinigung.
 DB_BACKUP_KEEP=10
+
+# Automatische Reparatur einer sqlx-Fehlermeldung der Form
+# "migration X was previously applied but has been modified":
+#
+# Dieser Fall tritt (nur) auf, wenn OXICLOUD_VERSION_PIN="" ist (main-Branch
+# wird verfolgt) UND Upstream eine bereits ausgelieferte, bei euch schon
+# angewendete Migration nachträglich inhaltlich geändert hat. sqlx bricht
+# dann absichtlich ab - das ist ein Schutzmechanismus gegen unbemerkt
+# veränderte Migrationshistorien, kein Bug.
+#
+# Standard (false): Script bricht wie bisher mit Fehlermeldung und klarer
+# Handlungsanweisung ab. Ihr entscheidet danach bewusst und manuell, ob die
+# Änderung an der Migration tatsächlich nur ein harmloser/idempotenter
+# Rewrite war, bevor ihr den sqlx-Tracking-Eintrag löscht und neu migriert.
+#
+# true: Das Script parst die betroffene Migrationsversion automatisch aus
+# der sqlx-Fehlermeldung, löscht ihren Eintrag in _sqlx_migrations und führt
+# die Migration danach einmal automatisch erneut aus (mit dem neuen Inhalt).
+# Das DB-Backup vor der Migration (siehe DB_BACKUP_KEEP oben) existiert in
+# diesem Moment bereits und dient als Absicherung nach unten.
+#
+# ACHTUNG: true hebt für den betroffenen Fall genau den sqlx-Schutz auf, der
+# eine unbemerkt veränderte, bereits angewendete Migration eigentlich
+# verhindern soll. Nur aktivieren, wenn ihr bewusst darauf vertraut, dass
+# nachträgliche Änderungen von Upstream an bereits angewendeten Migrationen
+# ausschließlich sichere/idempotente Rewrites sind (z.B. reine
+# Performance-Optimierungen ohne Semantikänderung), nicht aber
+# Semantikänderungen. Der eigentlich robustere Weg gegen dieses Szenario
+# bleibt OXICLOUD_VERSION_PIN auf einen festen Release-Tag zu setzen (siehe
+# dort) - dieser Schalter hier ändert daran nichts und wird auch bei
+# true=false weiterhin in der Warnmeldung empfohlen.
+AUTO_REPAIR_MODIFIED_MIGRATIONS=false
 
 # Unterhalb dieser freien GB unter ${OXICLOUD_HOME%/*} bricht das Script
 # VOR dem Build hart ab.
@@ -1043,12 +1113,71 @@ echo "==> Führe ausstehende Datenbank-Migrationen aus (sqlx migrate run)..."
 if [[ "${DRY_RUN}" == "true" ]]; then
   echo "    [DRY_RUN] würde 'cargo sqlx migrate run' ausführen."
 else
-  sudo -u "${OXICLOUD_USER}" bash -c "
-    source '${RUSTUP_ENV}'
-    cd '${OXICLOUD_HOME}'
-    export DATABASE_URL='${DATABASE_URL}'
-    cargo sqlx migrate run
-  "
+  # Fix (1.20): Kapselt "cargo sqlx migrate run" in eine Funktion, damit sie
+  # bei Bedarf (siehe unten) ein zweites Mal aufgerufen werden kann, ohne
+  # den Aufruf doppelt auszuschreiben.
+  run_migrations() {
+    sudo -u "${OXICLOUD_USER}" bash -c "
+      source '${RUSTUP_ENV}'
+      cd '${OXICLOUD_HOME}'
+      export DATABASE_URL='${DATABASE_URL}'
+      cargo sqlx migrate run
+    "
+  }
+
+  # Ausgabe wird sowohl mitgeschrieben (für die spätere Auswertung des
+  # Fehlertexts) als auch weiterhin normal ins Log/stdout durchgereicht.
+  set +e
+  MIGRATE_OUTPUT="$(run_migrations 2>&1)"
+  MIGRATE_STATUS=$?
+  set -e
+  echo "${MIGRATE_OUTPUT}"
+
+  if [[ "${MIGRATE_STATUS}" -ne 0 ]]; then
+    # Erkennt sqlx' Fehlermeldung "migration X was previously applied but
+    # has been modified" und extrahiert die betroffene Versionsnummer X.
+    MODIFIED_VERSION="$(printf '%s\n' "${MIGRATE_OUTPUT}" \
+      | grep -oP 'migration \K[0-9]+(?= was previously applied but has been modified)' | head -1)"
+
+    if [[ -n "${MODIFIED_VERSION}" ]]; then
+      echo "" >&2
+      echo "WARNUNG: Migration ${MODIFIED_VERSION} wurde bereits angewendet, ihr Inhalt" >&2
+      echo "wurde seitdem aber geändert (sqlx-Checksummen-Mismatch). Das passiert, weil" >&2
+      echo "dieser Lauf ungepinnt dem main-Branch folgt (OXICLOUD_VERSION_PIN=\"\") und" >&2
+      echo "Upstream eine bereits ausgelieferte Migration nachträglich umgeschrieben hat." >&2
+      echo "Empfehlung: OXICLOUD_VERSION_PIN im Konfigurationsblock auf einen festen" >&2
+      echo "Release-Tag setzen, damit das künftig nicht mehr passiert." >&2
+
+      if [[ "${AUTO_REPAIR_MODIFIED_MIGRATIONS}" == "true" ]]; then
+        echo "" >&2
+        echo "AUTO_REPAIR_MODIFIED_MIGRATIONS=true: entferne den Tracking-Eintrag für" >&2
+        echo "Migration ${MODIFIED_VERSION} aus _sqlx_migrations und führe sie mit dem" >&2
+        echo "neuen Inhalt automatisch erneut aus. Ein DB-Backup wurde vor dieser" >&2
+        echo "Migration bereits angelegt (siehe oben)." >&2
+        PGPASSWORD="${DB_PASS}" psql -h localhost -U "${DB_USER}" -d "${DB_NAME}" \
+          -c "DELETE FROM _sqlx_migrations WHERE version = ${MODIFIED_VERSION};"
+        echo "    Tracking-Eintrag für Migration ${MODIFIED_VERSION} entfernt, wiederhole Migration..." >&2
+        run_migrations
+        echo "    Migration ${MODIFIED_VERSION} wurde erfolgreich mit dem neuen Inhalt erneut angewendet." >&2
+      else
+        echo "" >&2
+        echo "AUTO_REPAIR_MODIFIED_MIGRATIONS ist false (Standard): kein automatischer" >&2
+        echo "Eingriff. Bitte manuell prüfen, ob die Änderung an der Migrationsdatei" >&2
+        echo "tatsächlich nur ein sicherer/idempotenter Rewrite ist (Diff der Migration" >&2
+        echo "gegen den vorherigen Stand ansehen), dann ggf. von Hand beheben mit:" >&2
+        echo "  sudo -u postgres psql -d '${DB_NAME}' \\" >&2
+        echo "    -c \"DELETE FROM _sqlx_migrations WHERE version = ${MODIFIED_VERSION};\"" >&2
+        echo "und das Script erneut ausführen. Alternativ AUTO_REPAIR_MODIFIED_MIGRATIONS=true" >&2
+        echo "setzen, falls dieser Fall künftig automatisch behoben werden soll." >&2
+        exit "${MIGRATE_STATUS}"
+      fi
+    else
+      # Anderer Migrationsfehler - unverändertes Verhalten: Ausgabe wurde
+      # oben bereits geloggt, Script bricht mit dem ursprünglichen
+      # Exit-Code ab.
+      exit "${MIGRATE_STATUS}"
+    fi
+  fi
 fi
 
 if [[ "${NEED_BUILD}" -eq 1 ]]; then
@@ -1268,6 +1397,7 @@ echo " Node.js:           $( [[ -n "${NODE_VERSION_PIN}" ]] && echo "gepinnt auf
 echo " Rust:              $( [[ -n "${RUST_VERSION_PIN}" ]] && echo "gepinnt auf ${RUST_VERSION_PIN}" || echo "automatisch neueste stable (${NEW_RUST_VERSION})" )"
 echo " Datenbank:         ${DB_NAME} (User: ${DB_USER})"
 echo " DB-Passwort:       ${DB_PASS}"
+echo " Auto-Repair Migrationen: $( [[ "${AUTO_REPAIR_MODIFIED_MIGRATIONS}" == "true" ]] && echo "aktiviert" || echo "deaktiviert (Standard)" )"
 echo ""
 echo " (Das Passwort bleibt bei erneuter Ausführung unverändert, gespeichert in ${DB_PASS_FILE})"
 echo " Service-Status:    systemctl status oxicloud"
