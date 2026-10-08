@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.20
+Version: 1.21
 Lizenz: MIT
 
 ---
@@ -26,7 +26,8 @@ Lizenz: MIT
 | 1.17 | Selbstheilung bei fehlschlagendem `cargo build --release --locked` (Cargo.lock-Konflikt) |
 | 1.18 | Review-Runde mit 13 Fixes/Verbesserungen, siehe Abschnitt „Neuerungen in 1.18" unten: u. a. abgesicherte `latest`-Release-Ermittlung, vorgezogene Dependency-Verifizierung, optionales `GITHUB_TOKEN`, bedarfsgesteuerter + garantiert aufgeräumter Swapfile, neuer `current-good`-Rollback-Anker, tolerantere Health-Check-Codes, korrigierte ufw-Prüfung, Backup vor destruktivem Directory-Cleanup, sed-Escaping in `set_env_var()`, restriktivere Rechte auf `/etc/oxicloud`, robuste Diskspace-Ermittlung und neuer `DRY_RUN`-Modus |
 | 1.19 | Der Hinweis auf eine neuere Script-Version erscheint zusätzlich im finalen Zusammenfassungsblock statt nur mitten im scrollenden Lauf-Output, siehe Abschnitt „Neuerung in 1.19" unten — bleibt dafür seit dieser Version auch über den Update-Check-Cache hinweg sichtbar |
-| **1.20** | **Neuer, standardmäßig deaktivierter Schalter `AUTO_REPAIR_MODIFIED_MIGRATIONS`** für den Fall „migration X was previously applied but has been modified" (sqlx-Checksummen-Mismatch bei ungepinntem main-Branch), siehe Abschnitt „Neuerung in 1.20" unten |
+| 1.20 | Neuer, standardmäßig deaktivierter Schalter `AUTO_REPAIR_MODIFIED_MIGRATIONS` für den Fall „migration X was previously applied but has been modified" (sqlx-Checksummen-Mismatch bei ungepinntem main-Branch), siehe Abschnitt „Neuerung in 1.20" unten |
+| **1.21** | **Bugfix `.env`-Abgleich:** Auch auskommentierte, optionale Variablen der Vorlage werden jetzt samt Erklärungstext in eine bestehende `.env` übernommen; Vorlage wird unter `example.env`, `.env.example` und `env.example` gesucht, siehe Abschnitt „Neuerung in 1.21" unten |
 
 ---
 
@@ -43,6 +44,68 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerung in 1.21
+
+### `.env` wird vollständig mit der Vorlage abgeglichen – auch optionale Variablen
+
+**Das Problem:** Bei einer bereits bestehenden `.env` hat das Script bisher
+nur **aktive** Zeilen der Vorlage (`VARIABLE=wert`) übernommen. In der
+aktuellen `example.env` von OxiCloud sind aber nur rund 10 Variablen aktiv;
+die übrigen rund 170 Einstellungen stehen dort **auskommentiert**
+(`#VARIABLE=wert`), jeweils mit einem Erklärungstext darüber. Kommentarzeilen
+hat der Abgleich komplett übersprungen. Dadurch kamen diese optionalen
+Einstellungen nie in die `.env` – man sah dort also gar nicht, welche
+Möglichkeiten es gibt, und neue Optionen späterer OxiCloud-Versionen
+tauchten nie auf. Außerdem kannte das Script nur den Dateinamen
+`example.env` und brach ab, wenn die Vorlage fehlte.
+
+**Jetzt:**
+
+- Die Vorlage wird unter `example.env`, `.env.example` und `env.example`
+  gesucht (in dieser Reihenfolge). Fehlt sie ganz, gibt es nur einen
+  Hinweis; bei einer Erstinstallation wird dann eine leere `.env` angelegt,
+  in die das Script die nötigen Werte (`DATABASE_URL` usw.) wie bisher
+  selbst einträgt.
+- Jede Variable der Vorlage, die in der `.env` **weder aktiv noch
+  auskommentiert** vorkommt, wird **zusammen mit ihrem Erklärungstext**
+  angehängt – und zwar genau in der Form wie in der Vorlage:
+  - aktive Variablen bleiben aktiv, **auch wenn der Wert leer ist**,
+  - auskommentierte bleiben auskommentiert und haben damit keine Wirkung.
+
+  Das Ergebnis entspricht damit dem, was eine Neuinstallation (Kopie der
+  Vorlage) ergeben würde.
+- **Bestehende Werte werden nie verändert.** Eine Variable gilt als
+  vorhanden, wenn sie aktiv (`VARIABLE=…`, auch `export VARIABLE=…`) oder
+  auskommentiert (`#VARIABLE=…`, `# VARIABLE=…`) in der `.env` steht. Wer
+  eine Option bewusst auskommentiert hat, bekommt sie also nicht noch
+  einmal angehängt.
+- Der ergänzte Teil steht am Ende der `.env` unter einer Überschrift mit
+  Datum und dem Hinweis, dass auskommentierte Zeilen optional sind und zum
+  Aktivieren nur das `#` entfernt werden muss. Vorher wird wie gewohnt
+  eine Zeitstempel-Kopie der `.env` angelegt (`backup_file()`).
+- Die Ausgabe nennt die Anzahl der ergänzten Variablen, getrennt nach
+  aktiv und auskommentiert, und listet die aktiv ergänzten mit Namen auf.
+  Mit `DRY_RUN=true` sieht man vorher, was ergänzt würde.
+- Ein zweiter Lauf ergänzt nichts doppelt und meldet „`.env` ist
+  vollständig".
+
+**Technisch:** Der Abgleich läuft über ein kleines POSIX-`awk`-Programm
+(funktioniert auch mit `mawk`, wie es auf DietPi/Debian-Minimal üblich
+ist). Als Erklärungstext gilt der zusammenhängende Kommentarblock direkt
+über der Variablen bis zur vorherigen Leerzeile; Abschnittsüberschriften
+der Vorlage werden nicht mitkopiert. Windows-Zeilenenden (CRLF) in der
+Vorlage werden entfernt.
+
+**Beim ersten Lauf mit 1.21** werden bei einer älteren Installation einmalig
+viele Variablen ergänzt (bei der aktuellen Vorlage typischerweise gut 160,
+fast alle davon auskommentiert). Das ist gewollt. Die aktiv ergänzten
+entsprechen den Standardwerten einer Neuinstallation; `DATABASE_URL`,
+`OXICLOUD_DB_CONNECTION_STRING`, `OXICLOUD_STORAGE_PATH` und
+`OXICLOUD_STATIC_PATH` setzt das Script direkt danach wie bisher auf die
+richtigen Werte.
 
 ---
 
@@ -488,7 +551,7 @@ weitere Zeitstempel-Kopie unter `<verzeichnis>/backups/` an, bereinigte
 aber nie etwas. Im Unterschied zu `DB_BACKUP_KEEP` (Abschnitt 1.13) und
 `KEEP_RELEASES` wuchs dieses Verzeichnis damit unbegrenzt — besonders
 relevant bei `.env`, die pro Lauf potenziell **zweimal** gesichert wird
-(einmal beim Ergänzen neuer Variablen aus `example.env`, einmal direkt
+(einmal beim Ergänzen neuer Variablen aus der Vorlage, einmal direkt
 danach vor dem Setzen von `DATABASE_URL` etc.).
 
 Jetzt bereinigt `backup_file()` nach jedem Aufruf automatisch auf die
@@ -875,9 +938,11 @@ hinzugekommenen.
    main`. Lokale, nicht committete Änderungen an getrackten Dateien
    werden weiterhin vorher als Patch unter `local-changes-backup/`
    gesichert und dann verworfen.
-5. **`.env` erzeugen/ergänzen**: Bei Erstlauf wird `example.env` kopiert.
-   Bei bereits bestehender `.env` werden nur **fehlende** Variablen aus
-   einer neueren `example.env` automatisch angehängt — vorhandene Werte
+5. **`.env` erzeugen/ergänzen**: Bei Erstlauf wird die Vorlage
+   (`example.env`, `.env.example` oder `env.example`) kopiert. Bei bereits
+   bestehender `.env` werden alle **fehlenden** Variablen der Vorlage
+   angehängt — seit 1.21 auch die auskommentierten, optionalen, jeweils
+   mit Erklärungstext (siehe „Neuerung in 1.21") — vorhandene Werte
    bleiben unverändert. `DATABASE_URL` landet seit 1.11 ebenfalls in der
    `.env` (statt im systemd-Unit-File). Werte werden seit 1.18 vor dem
    Einsetzen für `sed` escaped (siehe „Neuerungen in 1.18", Punkt 10).
@@ -931,7 +996,7 @@ hinzugekommenen.
 | Was | Mechanismus |
 |---|---|
 | DB-Passwort | Persistiert in `/etc/oxicloud/.db_password` (`chmod 600`), wiederverwendet statt neu generiert — bei jedem Lauf aktiv gegen die Datenbank durchgesetzt (`ALTER ROLE`), nicht nur beim Erstanlegen vorausgesetzt |
-| Bestehende `.env`-Werte | Nur fehlende Variablen werden ergänzt, nichts wird überschrieben |
+| Bestehende `.env`-Werte | Nur fehlende Variablen werden ergänzt (seit 1.21 auch auskommentierte Optionen samt Erklärung), nichts wird überschrieben; bewusst auskommentierte Variablen gelten als vorhanden |
 | Lokale, nicht committete Änderungen in `OXICLOUD_HOME` | Werden vor jedem Pull/Reset als Patch unter `local-changes-backup/` gesichert (dann verworfen, da das Verzeichnis ausschließlich vom Script verwaltet werden soll) |
 | `.env`, systemd-Unit, `/etc/fstab` | Vor jedem Überschreiben wird eine Zeitstempel-Kopie in einem `backups/`-Unterordner neben der jeweiligen Datei angelegt — begrenzt auf die neuesten `GENERIC_BACKUP_KEEP` Stände pro Datei |
 | Nicht-leeres, noch nicht geklontes `OXICLOUD_HOME` *(neu in 1.18)* | Wird vor dem Leeren als Tarball unter `/etc/oxicloud/pre-clone-backups/` gesichert |
@@ -1047,6 +1112,21 @@ automatisierten Läufen nicht unbegrenzt wächst.
 ---
 
 ## Troubleshooting
+
+**Nach dem Update auf 1.21 ist die `.env` viel länger (neu in 1.21):**
+Gewollt. Beim ersten Lauf werden einmalig alle Variablen der Vorlage
+ergänzt, die bisher fehlten — fast alle auskommentiert und damit ohne
+Wirkung, jeweils mit Erklärung. Sie stehen gesammelt am Ende unter
+„Automatisch ergänzt aus …". Wer zum alten Stand zurück will, findet die
+vorherige Fassung unter `/etc/oxicloud/backups/`. Eine Option aktivieren:
+in `/etc/oxicloud/.env` das `#` vor der Zeile entfernen, Wert anpassen,
+dann `systemctl restart oxicloud`.
+
+**„Keine Vorlage (example.env, .env.example, env.example) gefunden" (neu in 1.21):**
+Im Quellcode unter `/opt/oxicloud` liegt keine Vorlage (z. B. weil
+Upstream die Datei umbenannt hat). Der Lauf bricht deshalb nicht ab, die
+`.env` wird nur nicht abgeglichen. Den Dateinamen im Repository
+nachsehen; falls er anders lautet, in `find_env_template()` ergänzen.
 
 **`error: migration X was previously applied but has been modified` (neu behandelt seit 1.20):**
 Tritt nur auf, wenn `OXICLOUD_VERSION_PIN=""` ist (main-Branch wird
