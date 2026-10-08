@@ -3,12 +3,23 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.21
+# Version:          1.22
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-10-08 UTC (.env-Abgleich mit Vorlage inkl. optionaler Variablen)
+# Zuletzt geändert: 2026-10-08 UTC (Sprachwahl für die .env: ENV_LANGUAGE)
 #
 # Changelog:
+#   1.22 - Neue Einstellung ENV_LANGUAGE ("" | "de" | "en") für die Sprache
+#          der Erklärungstexte in /etc/oxicloud/.env. Bei "de" dient
+#          ENV_TEMPLATE_DIR/example.env.de als Vorlage. Eine bestehende .env
+#          wird einmalig auf diese Vorlage umgebaut; dabei bleiben alle
+#          eigenen Werte erhalten - das Script vergleicht vorher/nachher die
+#          wirksamen Einstellungen und behält bei jeder Abweichung die alte
+#          .env. Eine Markierungszeile merkt sich die Sprache; danach werden
+#          nur noch neue Variablen ergänzt, in der gewählten Sprache, und wo
+#          es noch keine Übersetzung gibt, mit englischem Text samt Hinweis.
+#          Ein Sprachwechsel baut die .env erneut (geprüft) um. Standard ""
+#          = Verhalten wie 1.21.
 #   1.21 - BUGFIX .env-Abgleich: Bisher wurden aus example.env nur AKTIVE
 #          Variablen (KEY=...) in eine bestehende .env übernommen. Die
 #          meisten Einstellungen stehen in der Vorlage aber auskommentiert
@@ -257,7 +268,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben)
-SCRIPT_VERSION="1.21"
+SCRIPT_VERSION="1.22"
 
 # Simulationsmodus: true = keine echten Änderungen am System, nur Logging.
 # Nützlich um z.B. eine geänderte Konfiguration (ENV_OVERRIDE_*, Pins, ...)
@@ -281,6 +292,21 @@ KEEP_RELEASES=5
 # Versionen festnageln (optional). Leer lassen ("") = jeweils automatisch neueste Version verwenden.
 NODE_VERSION_PIN=""
 RUST_VERSION_PIN=""
+
+# Sprache der Erklärungstexte in /etc/oxicloud/.env (optional, neu in 1.22).
+#   ""   = wie bisher: .env wird nicht umgebaut, fehlende Variablen kommen mit
+#          dem Text der englischen example.env aus dem Repository dazu.
+#   "de" = deutsche .env. Vorlage: ENV_TEMPLATE_DIR/example.env.de (z. B. die
+#          mitgelieferte Übersetzung). Beim ersten Lauf wird eine bestehende
+#          .env einmalig auf diese Vorlage umgebaut - alle eigenen Werte
+#          bleiben erhalten, das Script prüft das nach dem Umbau und stellt
+#          bei der kleinsten Abweichung die alte .env wieder her. Danach
+#          werden nur noch neue Variablen ergänzt (auf Deutsch, falls schon
+#          übersetzt, sonst auf Englisch mit Hinweis "noch nicht übersetzt").
+#   "en" = englische .env im Aufbau der example.env (gleiches Verfahren).
+# Ein Wechsel der Sprache baut die .env erneut um (wieder mit Prüfung).
+ENV_LANGUAGE=""
+ENV_TEMPLATE_DIR="/etc/oxicloud"
 
 # .env-Werte gezielt überschreiben (optional). Leer lassen ("") = den Wert
 # aus example.env unverändert übernehmen.
@@ -971,20 +997,20 @@ STATIC_DIR="${OXICLOUD_HOME}/static"
 
 mkdir -p "${CONFIG_DIR}"
 chmod 750 "${CONFIG_DIR}"
-# Fix (1.21): Abgleich der .env mit der Vorlage aus dem Repository.
-# - Die Vorlage wird unter allen üblichen Namen gesucht (example.env,
-#   .env.example, env.example) statt nur unter example.env. Fehlt sie ganz,
-#   bricht das Script nicht mehr ab, sondern meldet es nur.
-# - Bisher wurden nur AKTIVE Variablen (KEY=...) übernommen. Die meisten
-#   Einstellungen stehen in der Vorlage aber als auskommentierte, optionale
-#   Variablen (#KEY=...) samt Erklärung darüber - die kamen nie in die .env.
-#   Jetzt wird jede Variable der Vorlage, die in der .env weder aktiv noch
-#   auskommentiert vorkommt, zusammen mit ihrem Erklärungstext übernommen,
-#   und zwar genau in der Form wie in der Vorlage: aktive bleiben aktiv
-#   (auch wenn der Wert leer ist), auskommentierte bleiben auskommentiert.
-#   So entspricht das Ergebnis dem, was eine Neuinstallation (Kopie der
-#   Vorlage) ergeben würde. Vorhandene Werte und eigene Einstellungen in der
-#   .env werden nie verändert.
+# .env-Abgleich mit der Vorlage (1.21) und Sprachwahl (1.22).
+# - Die Vorlage aus dem Repository wird unter example.env, .env.example und
+#   env.example gesucht. Fehlt sie, bricht das Script nicht ab.
+# - Jede Variable der Vorlage, die in der .env weder aktiv noch auskommentiert
+#   vorkommt, wird samt Erklärungstext ergänzt (aktiv bleibt aktiv, auch mit
+#   leerem Wert; auskommentiert bleibt auskommentiert). Vorhandene Werte werden
+#   nie verändert.
+# - ENV_LANGUAGE (siehe Konfigurationsblock) wählt die Sprache der Erklärungen.
+#   Ist sie gesetzt, wird die .env einmalig auf die Vorlage der gewählten
+#   Sprache umgebaut; danach wird nur noch ergänzt. Eine Markierungszeile in
+#   der .env merkt sich die Sprache.
+# Alle Parser sind POSIX-awk (laufen auch mit mawk).
+ENV_LANG_MARK="# install-oxicloud.sh: env-language="
+
 find_env_template() {
   local f
   for f in example.env .env.example env.example; do
@@ -996,19 +1022,34 @@ find_env_template() {
   return 1
 }
 
-# Schreibt nach $3 alle Blöcke (Erklärung + Variablenzeile) aus der Vorlage $1,
-# deren Variable in $2 nicht vorkommt; nach $4 eine Zeile "aktiv komment" und
-# danach die Liste der Namen. Nur POSIX-awk (läuft auch mit mawk).
+# Gemeinsamer awk-Baustein: Variablenname einer Zeile (aktiv oder #auskommentiert).
+ENV_AWK_VARNAME='
+  function varname(line,   t, c) {
+    t = line
+    sub(/\r$/, "", t)
+    c = (t ~ /^[ \t]*#/)
+    sub(/^[ \t]*#?[ \t]*(export[ \t]+)?/, "", t)
+    # aktive Zeilen: jeder gültige Name; auskommentierte: nur GROSS (sonst Prosa)
+    if (c ? (t ~ /^[A-Z_][A-Z0-9_]*=/) : (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) return substr(t, 1, index(t, "=") - 1)
+    return ""
+  }
+  function isactive(line) { return line !~ /^[ \t]*#/ }
+'
+
+# Alle Variablennamen einer Datei (je Zeile einer).
+env_keys() {
+  awk "${ENV_AWK_VARNAME}"'{ k = varname($0); if (k != "") print k }' "$1" | sort -u
+}
+
+# env_missing_blocks VORLAGE ENV AUSGABE STATISTIK [ERLAUBT] [HINWEIS]
+# Schreibt nach AUSGABE alle Blöcke (Erklärung + Variablenzeile) aus VORLAGE,
+# deren Variable in ENV nicht vorkommt; optional nur Variablen aus der Datei
+# ERLAUBT (ein Name pro Zeile) und mit einer HINWEIS-Zeile vor jedem Block.
+# STATISTIK: Zeile 1 "aktiv auskommentiert", Zeile 2 die Namen.
 env_missing_blocks() {
-  awk -v outfile="$3" -v statfile="$4" '
-    function varname(line,   t) {
-      t = line
-      sub(/\r$/, "", t)
-      sub(/^[ \t]*#?[ \t]*(export[ \t]+)?/, "", t)
-      if (t ~ /^[A-Z_][A-Z0-9_]*=/) return substr(t, 1, index(t, "=") - 1)
-      return ""
-    }
-    FNR == NR { k = varname($0); if (k != "") have[k] = 1; next }
+  awk -v outfile="$3" -v statfile="$4" -v allowfile="${5:-}" -v note="${6:-}" "${ENV_AWK_VARNAME}"'
+    BEGIN { if (allowfile != "") { useallow = 1; while ((getline a < allowfile) > 0) allow[a] = 1 } }
+    FILENAME == ARGV[1] { k = varname($0); if (k != "") have[k] = 1; next }
     {
       line = $0; sub(/\r$/, "", line)
       if (line ~ /^[ \t]*$/) { cbuf = ""; afterVar = 0; next }
@@ -1019,25 +1060,203 @@ env_missing_blocks() {
         next
       }
       afterVar = 1
-      if ((k in have) || (k in done)) next
+      if ((k in have) || (k in done) || (useallow && !(k in allow))) next
       done[k] = 1
-      printf "\n%s%s\n", cbuf, line > outfile
+      printf "\n%s%s%s\n", (note != "" ? note "\n" : ""), cbuf, line > outfile
       cbuf = ""
-      if (line ~ /^[ \t]*#/) nc++; else na++
+      if (isactive(line)) na++; else nc++
       names = names " " k
     }
     END { printf "%d %d\n%s\n", na + 0, nc + 0, names > statfile }
   ' "$2" "$1"
 }
 
+# Wirksame Einstellungen einer .env wie systemd sie liest (letzte aktive Zeile
+# je Variable gewinnt), sortiert - zum Vergleich vor/nach einem Umbau.
+env_effective() {
+  awk "${ENV_AWK_VARNAME}"'
+    { line = $0; sub(/\r$/, "", line); k = varname(line)
+      if (k != "" && isactive(line)) { v = line; sub(/^[ \t]*(export[ \t]+)?/, "", v); val[k] = v } }
+    END { for (k in val) print val[k] }
+  ' "$1" | sort
+}
+
+# env_rebuild VORLAGE ALTE_ENV REPO_SCHLÜSSEL NEUE_ENV
+# Baut die .env im Aufbau der VORLAGE neu: Für jede Variable wird die eigene
+# Zeile aus ALTE_ENV eingesetzt (aktiv, sonst auskommentiert), alles andere
+# kommt aus der Vorlage. Blöcke der Vorlage, deren Variable es im Repository
+# nicht (mehr) gibt und die in ALTE_ENV nicht vorkommt, entfallen. Variablen
+# aus ALTE_ENV, die die Vorlage nicht kennt, kommen ans Ende.
+env_rebuild() {
+  awk -v repofile="$3" -v otherhdr="$5" "${ENV_AWK_VARNAME}"'
+    BEGIN { while ((getline a < repofile) > 0) repo[a] = 1 }
+    FILENAME == ARGV[1] {
+      line = $0; sub(/\r$/, "", line); k = varname(line)
+      if (k == "") next
+      if (!(k in seen)) { seen[k] = 1; order[++n] = k }
+      if (isactive(line)) act[k] = line
+      else if (!(k in com)) com[k] = line
+      next
+    }
+    function flush() { printf "%s", cbuf; cbuf = "" }
+    {
+      line = $0; sub(/\r$/, "", line)
+      if (line ~ /^[ \t]*$/) { flush(); print ""; next }
+      k = varname(line)
+      if (k == "") { cbuf = cbuf line "\n"; next }
+      if (!(k in repo) && !(k in act) && !(k in com)) { cbuf = ""; next }
+      flush()
+      if (!(k in placed)) {
+        placed[k] = 1
+        if (k in act) { print act[k]; next }
+        if (k in com) { print com[k]; next }
+        print line; next
+      }
+      # weitere Zeile derselben Variable in der Vorlage: nie zusätzlich aktiv
+      if (isactive(line)) print "#" line; else print line
+    }
+    END {
+      flush()
+      first = 1
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        if (k in placed) continue
+        if (first) { printf "\n%s\n", otherhdr; first = 0 }
+        if (k in act) print act[k]; else print com[k]
+      }
+    }
+  ' "$2" "$1" > "$4"
+}
+
+# Vorlage für die gewählte Sprache (leer, wenn nicht vorhanden).
+env_lang_template() {
+  local lang="$1" repo_tpl="$2"
+  case "${lang}" in
+    "") return 0 ;;
+    en) printf '%s\n' "${repo_tpl}" ;;
+    *)  [[ -f "${ENV_TEMPLATE_DIR}/example.env.${lang}" ]] && printf '%s\n' "${ENV_TEMPLATE_DIR}/example.env.${lang}" ;;
+  esac
+  return 0
+}
+
+# Texte für die Überschriften der ergänzten Teile.
+env_texts() {
+  if [[ "${ENV_LANGUAGE}" == "de" || -z "${ENV_LANGUAGE}" ]]; then
+    ENV_TXT_ADDED="Automatisch ergänzt aus"
+    ENV_TXT_OPTIONAL="# Auskommentierte Zeilen (#VARIABLE=...) sind optional und ohne Wirkung.
+# Zum Aktivieren das # entfernen und den Wert anpassen."
+    ENV_TXT_UNTRANSLATED="# [noch nicht übersetzt - Text aus der englischen Vorlage des Repositorys]"
+    ENV_TXT_OTHER="# --- Weitere Einstellungen aus der bisherigen .env (nicht in der Vorlage) ---"
+  else
+    ENV_TXT_ADDED="Automatically added from"
+    ENV_TXT_OPTIONAL="# Commented lines (#VARIABLE=...) are optional and have no effect.
+# Remove the # and adjust the value to enable them."
+    ENV_TXT_UNTRANSLATED="# [not translated yet - text from the repository template]"
+    ENV_TXT_OTHER="# --- Further settings from the previous .env (not in the template) ---"
+  fi
+}
+
+# Fehlende Variablen an die .env anhängen. $1 = Vorlage mit den Texten,
+# $2 = Repository-Vorlage (maßgeblich dafür, welche Variablen es gibt).
+env_append_missing() {
+  local text_tpl="$1" repo_tpl="$2" env="${CONFIG_DIR}/.env"
+  local add stat add2 stat2 keys na=0 nc=0 na2=0 nc2=0 names names2
+  add="$(mktemp)"; stat="$(mktemp)"; add2="$(mktemp)"; stat2="$(mktemp)"; keys="$(mktemp)"
+  env_keys "${repo_tpl}" > "${keys}"
+  : > "${add}"; : > "${add2}"
+  env_missing_blocks "${text_tpl}" "${env}" "${add}" "${stat}" "${keys}"
+  read -r na nc < "${stat}"; names="$(sed -n '2p' "${stat}")"
+  if [[ "${text_tpl}" != "${repo_tpl}" ]]; then
+    # was die Übersetzung (noch) nicht kennt, kommt aus der Repository-Vorlage
+    local tmpenv; tmpenv="$(mktemp)"
+    cat "${env}" "${add}" > "${tmpenv}"
+    env_missing_blocks "${repo_tpl}" "${tmpenv}" "${add2}" "${stat2}" "" "${ENV_TXT_UNTRANSLATED}"
+    read -r na2 nc2 < "${stat2}"; names2="$(sed -n '2p' "${stat2}")"
+    rm -f "${tmpenv}"
+  fi
+  local total=$(( na + nc + na2 + nc2 ))
+  if [[ ${total} -eq 0 ]]; then
+    echo "    .env ist vollständig: alle Variablen der Vorlage sind vorhanden (aktiv oder auskommentiert)."
+  elif [[ "${DRY_RUN}" == "true" ]]; then
+    echo "    [DRY_RUN] würde ${total} Variable(n) ergänzen ($(( na + na2 )) aktiv, $(( nc + nc2 )) auskommentiert), z. B.:$(printf '%s\n' ${names} ${names2:-} | head -n 12 | tr '\n' ' ' | sed 's/^/ /')…"
+  else
+    backup_file "${env}"
+    {
+      echo ""
+      echo "# ============================================================================="
+      local src; src="$(basename "${text_tpl}")"
+      [[ -s "${add2}" ]] && src="${src} / $(basename "${repo_tpl}")"
+      echo "# ${ENV_TXT_ADDED} ${src} $(date '+%Y-%m-%d %H:%M:%S')"
+      echo "${ENV_TXT_OPTIONAL}"
+      echo "# ============================================================================="
+      cat "${add}" "${add2}"
+    } >> "${env}"
+    echo "    Ergänzt: ${total} Variable(n), davon $(( na + na2 )) aktiv und $(( nc + nc2 )) auskommentiert (optional)."
+    [[ $(( nc2 + na2 )) -gt 0 ]] && echo "    Davon noch nicht übersetzt (Text englisch): $(( na2 + nc2 )) -${names2}"
+    [[ $(( na + na2 )) -gt 0 ]] && echo "    Aktiv ergänzt:$(cat "${add}" "${add2}" | grep -v '^[[:space:]]*#' | grep -o '^[A-Z_][A-Z0-9_]*' | tr '\n' ' ' | sed 's/^/ /')"
+  fi
+  rm -f "${add}" "${stat}" "${add2}" "${stat2}" "${keys}"
+}
+
+# .env auf die Vorlage der gewählten Sprache umbauen (mit Prüfung).
+env_convert_language() {
+  local lang_tpl="$1" repo_tpl="$2" env="${CONFIG_DIR}/.env"
+  local keys new before after
+  keys="$(mktemp)"; new="$(mktemp)"; before="$(mktemp)"; after="$(mktemp)"
+  env_keys "${repo_tpl}" > "${keys}"
+  local body; body="$(mktemp)"
+  env_rebuild "${lang_tpl}" "${env}" "${keys}" "${body}" "${ENV_TXT_OTHER}"
+  { echo "${ENV_LANG_MARK}${ENV_LANGUAGE}"; cat "${body}"; } > "${new}"
+  rm -f "${body}"
+  env_effective "${env}" > "${before}"
+  env_effective "${new}" > "${after}"
+  # Jede bisher wirksame Einstellung muss unverändert wirksam bleiben.
+  local lost
+  lost="$(comm -23 "${before}" "${after}")"
+  if [[ -n "${lost}" ]]; then
+    echo "    WARNUNG: Umbau der .env auf '${ENV_LANGUAGE}' abgebrochen - diese Einstellungen wären verändert worden:"
+    printf '%s\n' "${lost}" | sed 's/=.*/=…/; s/^/      /'
+    echo "    Die .env bleibt unverändert; es werden nur fehlende Variablen ergänzt."
+    rm -f "${keys}" "${new}" "${before}" "${after}"
+    return 1
+  fi
+  local gained; gained="$(comm -13 "${before}" "${after}" | sed 's/=.*//' | tr '\n' ' ')"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "    [DRY_RUN] würde die .env auf die Vorlage $(basename "${lang_tpl}") umbauen (eigene Werte bleiben erhalten)."
+    [[ -n "${gained// /}" ]] && echo "    [DRY_RUN] dabei neu wirksam (Standardwerte der Vorlage): ${gained}"
+  else
+    backup_file "${env}"
+    cat "${new}" > "${env}"
+    echo "    .env auf Vorlage $(basename "${lang_tpl}") umgebaut; alle bisherigen Werte sind erhalten (geprüft)."
+    [[ -n "${gained// /}" ]] && echo "    Neu wirksam (Standardwerte der Vorlage, wie bei einer Neuinstallation): ${gained}"
+    echo "    Die vorherige Fassung liegt unter ${CONFIG_DIR}/backups/."
+  fi
+  rm -f "${keys}" "${new}" "${before}" "${after}"
+  return 0
+}
+
+env_texts
 ENV_TEMPLATE="$(find_env_template || true)"
+ENV_LANG_TEMPLATE=""
+if [[ -n "${ENV_LANGUAGE}" && -n "${ENV_TEMPLATE}" ]]; then
+  ENV_LANG_TEMPLATE="$(env_lang_template "${ENV_LANGUAGE}" "${ENV_TEMPLATE}")"
+  if [[ -z "${ENV_LANG_TEMPLATE}" ]]; then
+    echo "    WARNUNG: ENV_LANGUAGE=${ENV_LANGUAGE}, aber ${ENV_TEMPLATE_DIR}/example.env.${ENV_LANGUAGE} fehlt - verwende die Vorlage aus dem Repository."
+  fi
+fi
+
 if [[ ! -f "${CONFIG_DIR}/.env" ]]; then
   if [[ -z "${ENV_TEMPLATE}" ]]; then
     echo "    WARNUNG: Keine Vorlage (example.env, .env.example, env.example) in ${OXICLOUD_HOME} gefunden."
     echo "    Es wird eine leere .env angelegt; die nötigen Werte setzt das Script unten selbst."
     [[ "${DRY_RUN}" == "true" ]] || : > "${CONFIG_DIR}/.env"
   elif [[ "${DRY_RUN}" == "true" ]]; then
-    echo "    [DRY_RUN] würde ${ENV_TEMPLATE} nach ${CONFIG_DIR}/.env kopieren."
+    echo "    [DRY_RUN] würde ${CONFIG_DIR}/.env aus $(basename "${ENV_LANG_TEMPLATE:-${ENV_TEMPLATE}}") anlegen."
+  elif [[ -n "${ENV_LANG_TEMPLATE}" ]]; then
+    : > "${CONFIG_DIR}/.env"
+    env_convert_language "${ENV_LANG_TEMPLATE}" "${ENV_TEMPLATE}" >/dev/null || true
+    [[ "${ENV_LANG_TEMPLATE}" != "${ENV_TEMPLATE}" ]] && env_append_missing "${ENV_LANG_TEMPLATE}" "${ENV_TEMPLATE}" >/dev/null
+    echo "    .env aus $(basename "${ENV_LANG_TEMPLATE}") angelegt (Sprache: ${ENV_LANGUAGE})."
   else
     cp "${ENV_TEMPLATE}" "${CONFIG_DIR}/.env"
     echo "    .env aus $(basename "${ENV_TEMPLATE}") angelegt."
@@ -1045,34 +1264,12 @@ if [[ ! -f "${CONFIG_DIR}/.env" ]]; then
 elif [[ -z "${ENV_TEMPLATE}" ]]; then
   echo "    Hinweis: Keine Vorlage (example.env, .env.example, env.example) gefunden - Abgleich übersprungen."
 else
-  echo "    Gleiche .env mit $(basename "${ENV_TEMPLATE}") ab (auch auskommentierte, optionale Variablen)..."
-  ENV_ADD_FILE="$(mktemp)"
-  ENV_STAT_FILE="$(mktemp)"
-  env_missing_blocks "${ENV_TEMPLATE}" "${CONFIG_DIR}/.env" "${ENV_ADD_FILE}" "${ENV_STAT_FILE}"
-  read -r ENV_ADD_ACTIVE ENV_ADD_COMMENTED < "${ENV_STAT_FILE}"
-  ENV_ADD_NAMES="$(sed -n '2p' "${ENV_STAT_FILE}")"
-  ENV_ADD_TOTAL=$(( ENV_ADD_ACTIVE + ENV_ADD_COMMENTED ))
-  if [[ ${ENV_ADD_TOTAL} -gt 0 ]]; then
-    if [[ "${DRY_RUN}" == "true" ]]; then
-      echo "    [DRY_RUN] würde ${ENV_ADD_TOTAL} Variable(n) ergänzen (${ENV_ADD_ACTIVE} aktiv, ${ENV_ADD_COMMENTED} auskommentiert), z. B.:$(printf '%s\n' ${ENV_ADD_NAMES} | head -n 12 | tr '\n' ' ' | sed 's/^/ /')…"
-    else
-      backup_file "${CONFIG_DIR}/.env"
-      {
-        echo ""
-        echo "# ============================================================================="
-        echo "# Automatisch ergänzt aus $(basename "${ENV_TEMPLATE}") am $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "# Auskommentierte Zeilen (#VARIABLE=...) sind optional und ohne Wirkung."
-        echo "# Zum Aktivieren das # entfernen und den Wert anpassen."
-        echo "# ============================================================================="
-        cat "${ENV_ADD_FILE}"
-      } >> "${CONFIG_DIR}/.env"
-      echo "    Ergänzt: ${ENV_ADD_TOTAL} Variable(n), davon ${ENV_ADD_ACTIVE} aktiv und ${ENV_ADD_COMMENTED} auskommentiert (optional)."
-      [[ ${ENV_ADD_ACTIVE} -gt 0 ]] && echo "    Aktiv ergänzt:$(grep -v '^[[:space:]]*#' "${ENV_ADD_FILE}" | grep -o '^[A-Z_][A-Z0-9_]*' | tr '\n' ' ' | sed 's/^/ /')"
-    fi
-  else
-    echo "    .env ist vollständig: alle Variablen aus $(basename "${ENV_TEMPLATE}") sind vorhanden (aktiv oder auskommentiert)."
+  if [[ -n "${ENV_LANG_TEMPLATE}" ]] && ! grep -qxF "${ENV_LANG_MARK}${ENV_LANGUAGE}" "${CONFIG_DIR}/.env"; then
+    echo "    Baue .env auf die Sprache '${ENV_LANGUAGE}' um (Vorlage $(basename "${ENV_LANG_TEMPLATE}"))..."
+    env_convert_language "${ENV_LANG_TEMPLATE}" "${ENV_TEMPLATE}" || ENV_LANG_TEMPLATE=""
   fi
-  rm -f "${ENV_ADD_FILE}" "${ENV_STAT_FILE}"
+  echo "    Gleiche .env mit der Vorlage ab (auch auskommentierte, optionale Variablen)..."
+  env_append_missing "${ENV_LANG_TEMPLATE:-${ENV_TEMPLATE}}" "${ENV_TEMPLATE}"
 fi
 
 mkdir -p "${STORAGE_DIR}"
