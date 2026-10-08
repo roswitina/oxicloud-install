@@ -1,15 +1,34 @@
-
 #!/usr/bin/env bash
 #
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.23
+# Version:          1.25
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-10-08 UTC (Update-Hinweis nur noch bei neuerer Version)
+# Zuletzt geändert: 2026-10-08 UTC (stiller Abbruch nach dem Preflight behoben)
 #
 # Changelog:
+#   1.25 - BUGFIX stiller Abbruch: Das Script endete direkt nach "Basis-
+#          Abhängigkeiten sind vorhanden" ohne jede Meldung. Ursache war die
+#          Selbstprüfung auf eine neuere Script-Version: Die von GitHub
+#          geladene Fassung wurde per "printf | grep -m1" durchsucht; seit
+#          das Script größer als 64 KB ist (Pipe-Puffer), bekam printf nach
+#          dem ersten Treffer ein SIGPIPE, und "set -o pipefail" beendete das
+#          Script kommentarlos (Exit 141). Jetzt Here-String statt Pipe. Die
+#          gleiche Falle bei der Auswertung einer fehlgeschlagenen Migration
+#          (kein Treffer = stiller Abbruch statt Fehlermeldung) ist ebenfalls
+#          behoben. Zusätzlich meldet ein ERR-Trap künftig jeden unerwarteten
+#          Abbruch mit Zeilennummer, statt still zu enden.
+#   1.24 - Ruhigere Läufe, wenn nichts ansteht:
+#          1) BUGFIX Paketprüfung: Pakete, die von einem anderen installierten
+#             Paket bereitgestellt werden (dpkg "Provides"), gelten jetzt als
+#             vorhanden. Unter Debian 13 ist postgresql-contrib virtuell
+#             (bereitgestellt von "postgresql"), wurde deshalb bei jedem Lauf
+#             als fehlend gemeldet und löste unnötig apt-get update/install aus.
+#          2) Der ausführliche Ressourcen-Hinweis zum Kompilieren erscheint nur
+#             noch, wenn tatsächlich gebaut wird. Sonst steht am Anfang nur
+#             eine kurze Zeile mit CPU/RAM/Speicher.
 #   1.23 - BUGFIX Update-Hinweis: Er erschien auch, wenn auf GitHub eine
 #          ÄLTERE Version lag, und zeigte nach einem lokalen Script-Update
 #          bis zu UPDATE_CHECK_INTERVAL_HOURS lang einen veralteten Stand aus
@@ -279,7 +298,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben)
-SCRIPT_VERSION="1.23"
+SCRIPT_VERSION="1.25"
 
 # Simulationsmodus: true = keine echten Änderungen am System, nur Logging.
 # Nützlich um z.B. eine geänderte Konfiguration (ENV_OVERRIDE_*, Pins, ...)
@@ -456,6 +475,14 @@ SWAP_AUTO_CREATED=0
 cleanup_on_exit() {
   local exit_code=$?
 
+  # Fix (1.25): Unerwartete Abbrüche (set -e / pipefail) nicht mehr still.
+  if [[ "${exit_code}" -ne 0 && -n "${LAST_ERR_LINE:-}" ]]; then
+    echo "" >&2
+    echo "==> ABBRUCH: unerwarteter Fehler in Zeile ${LAST_ERR_LINE} (Exit-Code ${exit_code})." >&2
+    echo "    Befehl: ${LAST_ERR_CMD:-?}" >&2
+    echo "    Bitte diese Meldung und das Log (${LOG_FILE:-/var/log/oxicloud-install.log}) weitergeben." >&2
+  fi
+
   if [[ "${SWAP_AUTO_CREATED}" -eq 1 ]]; then
     echo "==> Cleanup: entferne automatisch angelegten Swapfile ${SWAP_FILE} wieder..." >&2
     swapoff "${SWAP_FILE}" 2>/dev/null || true
@@ -476,6 +503,10 @@ cleanup_on_exit() {
   return "${exit_code}"
 }
 trap cleanup_on_exit EXIT
+# Fix (1.25): merkt sich Zeile und Befehl eines unerwarteten Fehlers für die
+# Meldung in cleanup_on_exit (errtrace, damit das auch in Funktionen greift).
+set -o errtrace
+trap 'LAST_ERR_LINE=${LINENO}; LAST_ERR_CMD=${BASH_COMMAND}' ERR
 
 if [[ $EUID -ne 0 ]]; then
   echo "Bitte als root bzw. mit sudo ausführen." >&2
@@ -558,25 +589,37 @@ ACTUAL_RAM_GB="$(($(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 / 1024))"
 ACTUAL_DISK_GB="$(df --output=avail -BG "${OXICLOUD_HOME%/*}" 2>/dev/null | tail -1 | tr -dc '0-9')"
 : "${ACTUAL_DISK_GB:=0}"
 
-echo "======================================================================"
-echo " Ressourcenbedarf zum Kompilieren (Rust LTO + Node/Vite-Frontend-Build):"
-echo "   Empfohlen: ${RECOMMENDED_BUILD_CPUS}+ CPU-Kerne, ${RECOMMENDED_BUILD_RAM_GB}+ GB RAM, ~${RECOMMENDED_BUILD_DISK_GB} GB freier Speicher"
-echo "   Erkannt:   ${ACTUAL_CPUS} CPU-Kern(e), ca. ${ACTUAL_RAM_GB} GB RAM, ca. ${ACTUAL_DISK_GB} GB frei unter ${OXICLOUD_HOME%/*}"
-echo ""
-echo "   Grund: 'cargo build --release' mit LTO + codegen-units=1 + target-cpu=native"
-echo "   ist die speicherhungrigste Kompilier-Konfiguration, v.a. wegen des"
-echo "   umfangreichen Dependency-Sets (AWS/Azure SDKs, Tantivy, Bildverarbeitung)."
-echo "   Zu wenig RAM führt typischerweise zu einem vom OOM-Killer abgebrochenen"
-echo "   Build (Fehler: 'signal: 9, SIGKILL')."
-echo ""
-echo "   Nach erfolgreichem Build können CPU/RAM wieder auf den für den reinen"
-echo "   Betrieb nötigen Umfang zurückgestellt werden (z.B. 2 CPU-Kerne / 3 GB RAM)."
-if [[ "${ACTUAL_CPUS}" -lt "${RECOMMENDED_BUILD_CPUS}" || "${ACTUAL_RAM_GB}" -lt "${RECOMMENDED_BUILD_RAM_GB}" || "${ACTUAL_DISK_GB}" -lt "${RECOMMENDED_BUILD_DISK_GB}" ]]; then
+# Fix (1.24): Der ausführliche Ressourcen-Hinweis erscheint nur noch, wenn
+# tatsächlich gebaut wird (NEED_BUILD=1, siehe weiter unten). Bei Läufen ohne
+# Änderungen steht hier nur noch eine kurze Zeile.
+print_build_resource_banner() {
+  echo "======================================================================"
+  echo " Ressourcenbedarf zum Kompilieren (Rust LTO + Node/Vite-Frontend-Build):"
+  echo "   Empfohlen: ${RECOMMENDED_BUILD_CPUS}+ CPU-Kerne, ${RECOMMENDED_BUILD_RAM_GB}+ GB RAM, ~${RECOMMENDED_BUILD_DISK_GB} GB freier Speicher"
+  echo "   Erkannt:   ${ACTUAL_CPUS} CPU-Kern(e), ca. ${ACTUAL_RAM_GB} GB RAM, ca. ${ACTUAL_DISK_GB} GB frei unter ${OXICLOUD_HOME%/*}"
   echo ""
-  echo "   ACHTUNG: Aktuelle Ressourcen liegen unter der Empfehlung - der Build"
-  echo "   könnte fehlschlagen (v.a. bei RAM oder Speicherplatz)."
+  echo "   Grund: 'cargo build --release' mit LTO + codegen-units=1 + target-cpu=native"
+  echo "   ist die speicherhungrigste Kompilier-Konfiguration, v.a. wegen des"
+  echo "   umfangreichen Dependency-Sets (AWS/Azure SDKs, Tantivy, Bildverarbeitung)."
+  echo "   Zu wenig RAM führt typischerweise zu einem vom OOM-Killer abgebrochenen"
+  echo "   Build (Fehler: 'signal: 9, SIGKILL')."
+  echo ""
+  echo "   Nach erfolgreichem Build können CPU/RAM wieder auf den für den reinen"
+  echo "   Betrieb nötigen Umfang zurückgestellt werden (z.B. 2 CPU-Kerne / 3 GB RAM)."
+  if [[ "${ACTUAL_CPUS}" -lt "${RECOMMENDED_BUILD_CPUS}" || "${ACTUAL_RAM_GB}" -lt "${RECOMMENDED_BUILD_RAM_GB}" || "${ACTUAL_DISK_GB}" -lt "${RECOMMENDED_BUILD_DISK_GB}" ]]; then
+    echo ""
+    echo "   ACHTUNG: Aktuelle Ressourcen liegen unter der Empfehlung - der Build"
+    echo "   könnte fehlschlagen (v.a. bei RAM oder Speicherplatz)."
+  fi
+  echo "======================================================================"
+  echo ""
+}
+
+BUILD_RESOURCES_LOW=0
+if [[ "${ACTUAL_CPUS}" -lt "${RECOMMENDED_BUILD_CPUS}" || "${ACTUAL_RAM_GB}" -lt "${RECOMMENDED_BUILD_RAM_GB}" || "${ACTUAL_DISK_GB}" -lt "${RECOMMENDED_BUILD_DISK_GB}" ]]; then
+  BUILD_RESOURCES_LOW=1
 fi
-echo "======================================================================"
+echo "==> Ressourcen: ${ACTUAL_CPUS} CPU-Kern(e), ca. ${ACTUAL_RAM_GB} GB RAM, ca. ${ACTUAL_DISK_GB} GB frei unter ${OXICLOUD_HOME%/*}$( [[ ${BUILD_RESOURCES_LOW} -eq 1 ]] && echo " (für einen Neubau knapp - Hinweis folgt nur, falls gebaut wird)")"
 echo ""
 
 # ---- Harter Abbruch bei kritisch wenig Diskspace ---------------------------
@@ -591,9 +634,22 @@ fi
 
 echo "==> Preflight-Check: prüfe Basis-Pakete und installiere fehlende nach..."
 REQUIRED_APT_PACKAGES=(sudo git curl openssl build-essential pkg-config libssl-dev postgresql postgresql-contrib ca-certificates jq)
+# Fix (1.24): Ein Paket gilt auch dann als vorhanden, wenn ein installiertes
+# Paket es bereitstellt ("Provides"). Beispiel: Unter Debian 13 ist
+# postgresql-contrib ein virtuelles Paket, das "postgresql" bereitstellt;
+# "dpkg -s postgresql-contrib" schlägt daher immer fehl, und das Script hat
+# bisher bei JEDEM Lauf "Fehlende Pakete werden installiert: postgresql-contrib"
+# gemeldet und unnötig apt-get update/install ausgeführt.
+INSTALLED_PROVIDES="$(dpkg-query -W -f='${Status}|${Package},${Provides}\n' 2>/dev/null \
+  | awk -F'|' '$1 == "install ok installed" { print $2 }' \
+  | tr ',' '\n' | sed 's/([^)]*)//g; s/[[:space:]]//g; s/:.*$//' | sort -u)"
+pkg_present() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed" && return 0
+  grep -qxF "$1" <<< "${INSTALLED_PROVIDES}"
+}
 MISSING_PACKAGES=()
 for pkg in "${REQUIRED_APT_PACKAGES[@]}"; do
-  dpkg -s "${pkg}" &>/dev/null || MISSING_PACKAGES+=("${pkg}")
+  pkg_present "${pkg}" || MISSING_PACKAGES+=("${pkg}")
 done
 
 if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
@@ -664,7 +720,11 @@ if [[ "${CHECK_FOR_UPDATES}" == "true" ]] && command -v curl &>/dev/null; then
     REMOTE_RAW_SCRIPT="$(github_curl -fsS -m 5 \
       "https://raw.githubusercontent.com/${UPDATE_CHECK_REPO}/${UPDATE_CHECK_BRANCH}/install-oxicloud.sh" 2>/dev/null)" || true
     if [[ -n "${REMOTE_RAW_SCRIPT}" ]]; then
-      REMOTE_SCRIPT_VERSION="$(printf '%s\n' "${REMOTE_RAW_SCRIPT}" | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+      # Fix (1.25): Here-String statt "printf | grep -m1": grep -m1 beendet
+      # sich nach dem ersten Treffer, printf bekam bei Scripts über 64 KB
+      # (Pipe-Puffer) ein SIGPIPE, und mit "set -o pipefail" brach das ganze
+      # Script an dieser Stelle KOMMENTARLOS ab.
+      REMOTE_SCRIPT_VERSION="$(grep -m1 '^SCRIPT_VERSION=' <<< "${REMOTE_RAW_SCRIPT}" | cut -d'"' -f2 || true)"
       if version_gt "${REMOTE_SCRIPT_VERSION}" "${SCRIPT_VERSION}"; then
         UPDATE_AVAILABLE_VERSION="${REMOTE_SCRIPT_VERSION}"
         echo ""
@@ -988,6 +1048,10 @@ fi
 # oben), damit ein bei einem SPÄTEREN Abbruch (Build/Migration/Health-Check
 # schlägt fehl) angelegter Swapfile nicht dauerhaft aktiv bleibt.
 SWAP_SIZE_GB=8
+
+if [[ "${NEED_BUILD}" -eq 1 ]]; then
+  print_build_resource_banner
+fi
 
 if [[ "${NEED_BUILD}" -eq 1 && "${ACTUAL_RAM_GB}" -lt "${RECOMMENDED_BUILD_RAM_GB}" ]] && ! swapon --show | grep -q .; then
   echo "==> Wenig RAM erkannt, Rebuild ansteht und kein Swap aktiv: lege automatisch einen ${SWAP_SIZE_GB} GB Swapfile an (${SWAP_FILE})..."
@@ -1438,8 +1502,11 @@ else
   if [[ "${MIGRATE_STATUS}" -ne 0 ]]; then
     # Erkennt sqlx' Fehlermeldung "migration X was previously applied but
     # has been modified" und extrahiert die betroffene Versionsnummer X.
-    MODIFIED_VERSION="$(printf '%s\n' "${MIGRATE_OUTPUT}" \
-      | grep -oP 'migration \K[0-9]+(?= was previously applied but has been modified)' | head -1)"
+    # Fix (1.25): Here-String und "|| true" - ohne Treffer (andere
+    # Fehlerursache) brach das Script hier sonst wegen pipefail kommentarlos
+    # ab, statt die eigentliche Fehlermeldung unten auszugeben.
+    MODIFIED_VERSION="$(grep -oP 'migration \K[0-9]+(?= was previously applied but has been modified)' \
+      <<< "${MIGRATE_OUTPUT}" | head -1 || true)"
 
     if [[ -n "${MODIFIED_VERSION}" ]]; then
       echo "" >&2
