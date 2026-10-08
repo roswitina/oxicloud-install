@@ -3,12 +3,25 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.20
+# Version:          1.21
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-09-04 UTC (AUTO_REPAIR_MODIFIED_MIGRATIONS)
+# Zuletzt geändert: 2026-10-08 UTC (.env-Abgleich mit Vorlage inkl. optionaler Variablen)
 #
 # Changelog:
+#   1.21 - BUGFIX .env-Abgleich: Bisher wurden aus example.env nur AKTIVE
+#          Variablen (KEY=...) in eine bestehende .env übernommen. Die
+#          meisten Einstellungen stehen in der Vorlage aber auskommentiert
+#          (#KEY=...) mit Erklärung darüber und kamen dadurch nie in die
+#          .env - man sah also gar nicht, welche Optionen es gibt. Jetzt
+#          wird jede Variable der Vorlage, die in der .env weder aktiv noch
+#          auskommentiert vorkommt, samt Erklärungstext ergänzt, in genau
+#          der Form wie in der Vorlage (aktiv bleibt aktiv, auch mit leerem
+#          Wert; auskommentiert bleibt auskommentiert). Bestehende Werte
+#          werden nie verändert. Die Vorlage wird jetzt unter example.env,
+#          .env.example und env.example gesucht; fehlt sie, bricht das
+#          Script nicht mehr ab, sondern meldet es. Parser in POSIX-awk
+#          (auch mawk), CRLF-Zeilenenden und "export KEY=" werden erkannt.
 #   1.20 - Behandlung von "migration X was previously applied but has been
 #          modified" (sqlx-Checksummen-Mismatch). Tritt auf, weil dieses
 #          Script standardmäßig ungepinnt dem main-Branch folgt und Upstream
@@ -194,8 +207,9 @@
 #      jedem Lauf per rekursivem chown sicher, dass ${OXICLOUD_HOME}
 #      durchgängig oxicloud:oxicloud gehört (nur falls nötig).
 #   4. Clones/updates OxiCloud, configures /etc/oxicloud/.env. Bei bereits
-#      bestehender .env werden fehlende Variablen aus einer neueren
-#      example.env automatisch ergänzt. Standardmäßig wird immer der
+#      bestehender .env werden fehlende Variablen aus der Vorlage
+#      (example.env / .env.example / env.example) automatisch ergänzt -
+#      auch die auskommentierten, optionalen, jeweils mit Erklärungstext. Standardmäßig wird immer der
 #      main-Branch verfolgt; via OXICLOUD_VERSION_PIN kann stattdessen ein
 #      festes Release/Tag verwendet werden. Lokale, nicht committete
 #      Änderungen werden vor jedem Pull automatisch als Patch gesichert und
@@ -243,7 +257,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben)
-SCRIPT_VERSION="1.20"
+SCRIPT_VERSION="1.21"
 
 # Simulationsmodus: true = keine echten Änderungen am System, nur Logging.
 # Nützlich um z.B. eine geänderte Konfiguration (ENV_OVERRIDE_*, Pins, ...)
@@ -957,39 +971,108 @@ STATIC_DIR="${OXICLOUD_HOME}/static"
 
 mkdir -p "${CONFIG_DIR}"
 chmod 750 "${CONFIG_DIR}"
-if [[ ! -f "${CONFIG_DIR}/.env" ]]; then
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    echo "    [DRY_RUN] würde ${OXICLOUD_HOME}/example.env nach ${CONFIG_DIR}/.env kopieren."
-  else
-    cp "${OXICLOUD_HOME}/example.env" "${CONFIG_DIR}/.env"
-  fi
-else
-  echo "    Prüfe example.env auf neue Variablen, die in der bestehenden .env noch fehlen..."
-  ADDED_KEYS=()
-  while IFS= read -r line; do
-    [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
-    key="${line%%=*}"
-    [[ -z "${key}" || "${key}" == "${line}" ]] && continue
-    if ! grep -q "^${key}=" "${CONFIG_DIR}/.env"; then
-      ADDED_KEYS+=("${key}=${line#*=}")
+# Fix (1.21): Abgleich der .env mit der Vorlage aus dem Repository.
+# - Die Vorlage wird unter allen üblichen Namen gesucht (example.env,
+#   .env.example, env.example) statt nur unter example.env. Fehlt sie ganz,
+#   bricht das Script nicht mehr ab, sondern meldet es nur.
+# - Bisher wurden nur AKTIVE Variablen (KEY=...) übernommen. Die meisten
+#   Einstellungen stehen in der Vorlage aber als auskommentierte, optionale
+#   Variablen (#KEY=...) samt Erklärung darüber - die kamen nie in die .env.
+#   Jetzt wird jede Variable der Vorlage, die in der .env weder aktiv noch
+#   auskommentiert vorkommt, zusammen mit ihrem Erklärungstext übernommen,
+#   und zwar genau in der Form wie in der Vorlage: aktive bleiben aktiv
+#   (auch wenn der Wert leer ist), auskommentierte bleiben auskommentiert.
+#   So entspricht das Ergebnis dem, was eine Neuinstallation (Kopie der
+#   Vorlage) ergeben würde. Vorhandene Werte und eigene Einstellungen in der
+#   .env werden nie verändert.
+find_env_template() {
+  local f
+  for f in example.env .env.example env.example; do
+    if [[ -f "${OXICLOUD_HOME}/${f}" ]]; then
+      printf '%s\n' "${OXICLOUD_HOME}/${f}"
+      return 0
     fi
-  done < "${OXICLOUD_HOME}/example.env"
+  done
+  return 1
+}
 
-  if [[ ${#ADDED_KEYS[@]} -gt 0 ]]; then
+# Schreibt nach $3 alle Blöcke (Erklärung + Variablenzeile) aus der Vorlage $1,
+# deren Variable in $2 nicht vorkommt; nach $4 eine Zeile "aktiv komment" und
+# danach die Liste der Namen. Nur POSIX-awk (läuft auch mit mawk).
+env_missing_blocks() {
+  awk -v outfile="$3" -v statfile="$4" '
+    function varname(line,   t) {
+      t = line
+      sub(/\r$/, "", t)
+      sub(/^[ \t]*#?[ \t]*(export[ \t]+)?/, "", t)
+      if (t ~ /^[A-Z_][A-Z0-9_]*=/) return substr(t, 1, index(t, "=") - 1)
+      return ""
+    }
+    FNR == NR { k = varname($0); if (k != "") have[k] = 1; next }
+    {
+      line = $0; sub(/\r$/, "", line)
+      if (line ~ /^[ \t]*$/) { cbuf = ""; afterVar = 0; next }
+      k = varname(line)
+      if (k == "") {
+        if (afterVar) { cbuf = ""; afterVar = 0 }
+        cbuf = cbuf line "\n"
+        next
+      }
+      afterVar = 1
+      if ((k in have) || (k in done)) next
+      done[k] = 1
+      printf "\n%s%s\n", cbuf, line > outfile
+      cbuf = ""
+      if (line ~ /^[ \t]*#/) nc++; else na++
+      names = names " " k
+    }
+    END { printf "%d %d\n%s\n", na + 0, nc + 0, names > statfile }
+  ' "$2" "$1"
+}
+
+ENV_TEMPLATE="$(find_env_template || true)"
+if [[ ! -f "${CONFIG_DIR}/.env" ]]; then
+  if [[ -z "${ENV_TEMPLATE}" ]]; then
+    echo "    WARNUNG: Keine Vorlage (example.env, .env.example, env.example) in ${OXICLOUD_HOME} gefunden."
+    echo "    Es wird eine leere .env angelegt; die nötigen Werte setzt das Script unten selbst."
+    [[ "${DRY_RUN}" == "true" ]] || : > "${CONFIG_DIR}/.env"
+  elif [[ "${DRY_RUN}" == "true" ]]; then
+    echo "    [DRY_RUN] würde ${ENV_TEMPLATE} nach ${CONFIG_DIR}/.env kopieren."
+  else
+    cp "${ENV_TEMPLATE}" "${CONFIG_DIR}/.env"
+    echo "    .env aus $(basename "${ENV_TEMPLATE}") angelegt."
+  fi
+elif [[ -z "${ENV_TEMPLATE}" ]]; then
+  echo "    Hinweis: Keine Vorlage (example.env, .env.example, env.example) gefunden - Abgleich übersprungen."
+else
+  echo "    Gleiche .env mit $(basename "${ENV_TEMPLATE}") ab (auch auskommentierte, optionale Variablen)..."
+  ENV_ADD_FILE="$(mktemp)"
+  ENV_STAT_FILE="$(mktemp)"
+  env_missing_blocks "${ENV_TEMPLATE}" "${CONFIG_DIR}/.env" "${ENV_ADD_FILE}" "${ENV_STAT_FILE}"
+  read -r ENV_ADD_ACTIVE ENV_ADD_COMMENTED < "${ENV_STAT_FILE}"
+  ENV_ADD_NAMES="$(sed -n '2p' "${ENV_STAT_FILE}")"
+  ENV_ADD_TOTAL=$(( ENV_ADD_ACTIVE + ENV_ADD_COMMENTED ))
+  if [[ ${ENV_ADD_TOTAL} -gt 0 ]]; then
     if [[ "${DRY_RUN}" == "true" ]]; then
-      echo "    [DRY_RUN] würde ${#ADDED_KEYS[@]} neue Variable(n) ergänzen: $(printf '%s ' "${ADDED_KEYS[@]%%=*}")"
+      echo "    [DRY_RUN] würde ${ENV_ADD_TOTAL} Variable(n) ergänzen (${ENV_ADD_ACTIVE} aktiv, ${ENV_ADD_COMMENTED} auskommentiert), z. B.:$(printf '%s\n' ${ENV_ADD_NAMES} | head -n 12 | tr '\n' ' ' | sed 's/^/ /')…"
     else
       backup_file "${CONFIG_DIR}/.env"
       {
         echo ""
-        echo "# --- Automatisch ergänzt aus example.env am $(date '+%Y-%m-%d %H:%M:%S') ---"
-        printf '%s\n' "${ADDED_KEYS[@]}"
+        echo "# ============================================================================="
+        echo "# Automatisch ergänzt aus $(basename "${ENV_TEMPLATE}") am $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# Auskommentierte Zeilen (#VARIABLE=...) sind optional und ohne Wirkung."
+        echo "# Zum Aktivieren das # entfernen und den Wert anpassen."
+        echo "# ============================================================================="
+        cat "${ENV_ADD_FILE}"
       } >> "${CONFIG_DIR}/.env"
-      echo "    Neue Variablen ergänzt (${#ADDED_KEYS[@]}): $(printf '%s ' "${ADDED_KEYS[@]%%=*}")"
+      echo "    Ergänzt: ${ENV_ADD_TOTAL} Variable(n), davon ${ENV_ADD_ACTIVE} aktiv und ${ENV_ADD_COMMENTED} auskommentiert (optional)."
+      [[ ${ENV_ADD_ACTIVE} -gt 0 ]] && echo "    Aktiv ergänzt:$(grep -v '^[[:space:]]*#' "${ENV_ADD_FILE}" | grep -o '^[A-Z_][A-Z0-9_]*' | tr '\n' ' ' | sed 's/^/ /')"
     fi
   else
-    echo "    Keine neuen Variablen gefunden, .env bereits vollständig."
+    echo "    .env ist vollständig: alle Variablen aus $(basename "${ENV_TEMPLATE}") sind vorhanden (aktiv oder auskommentiert)."
   fi
+  rm -f "${ENV_ADD_FILE}" "${ENV_STAT_FILE}"
 fi
 
 mkdir -p "${STORAGE_DIR}"
