@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.22
+Version: 1.23
 Lizenz: MIT
 
 ---
@@ -28,7 +28,8 @@ Lizenz: MIT
 | 1.19 | Der Hinweis auf eine neuere Script-Version erscheint zusätzlich im finalen Zusammenfassungsblock statt nur mitten im scrollenden Lauf-Output, siehe Abschnitt „Neuerung in 1.19" unten — bleibt dafür seit dieser Version auch über den Update-Check-Cache hinweg sichtbar |
 | 1.20 | Neuer, standardmäßig deaktivierter Schalter `AUTO_REPAIR_MODIFIED_MIGRATIONS` für den Fall „migration X was previously applied but has been modified" (sqlx-Checksummen-Mismatch bei ungepinntem main-Branch), siehe Abschnitt „Neuerung in 1.20" unten |
 | 1.21 | Bugfix `.env`-Abgleich: Auch auskommentierte, optionale Variablen der Vorlage werden jetzt samt Erklärungstext in eine bestehende `.env` übernommen; Vorlage wird unter `example.env`, `.env.example` und `env.example` gesucht, siehe Abschnitt „Neuerung in 1.21" unten |
-| **1.22** | **Neue Einstellung `ENV_LANGUAGE`:** `.env` auf Deutsch (oder Englisch) anlegen bzw. einmalig umbauen – mit Prüfung, dass alle eigenen Werte erhalten bleiben; danach werden neue Variablen in der gewählten Sprache ergänzt, siehe Abschnitt „Neuerung in 1.22" unten |
+| 1.22 | Neue Einstellung `ENV_LANGUAGE`: `.env` auf Deutsch (oder Englisch) anlegen bzw. einmalig umbauen – mit Prüfung, dass alle eigenen Werte erhalten bleiben; danach werden neue Variablen in der gewählten Sprache ergänzt, siehe Abschnitt „Neuerung in 1.22" unten |
+| **1.23** | **Bugfix Update-Hinweis:** erscheint nur noch, wenn auf GitHub eine **neuere** Version liegt; nach einem lokalen Script-Update wird sofort neu geprüft statt einen veralteten Stand aus dem Cache zu zeigen, siehe Abschnitt „Fix in 1.23" unten |
 
 ---
 
@@ -45,6 +46,38 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Fix in 1.23
+
+### Update-Hinweis nur noch bei einer neueren Version auf GitHub
+
+**Das Problem:** Nach dem Hochladen einer neuen Script-Version auf GitHub
+meldete das Script trotzdem z. B.
+
+```
+Hinweis: Für install-oxicloud.sh liegt auf GitHub eine andere Version vor
+         (lokal: 1.22, dort auf 'main': 1.20).
+```
+
+Zwei Ursachen: Der Vergleich prüfte nur auf *ungleich*, meldete also auch
+eine **ältere** Version auf GitHub. Und das Ergebnis des letzten echten
+Checks lag bis zu `UPDATE_CHECK_INTERVAL_HOURS` (Standard 24 Stunden) im
+Cache `/etc/oxicloud/.update-check-install-oxicloud` – nach einem lokalen
+Update wurde also noch ein Tag lang der alte GitHub-Stand angezeigt.
+
+**Jetzt:**
+
+- Versionen werden der Größe nach verglichen (`sort -V`, also auch
+  `1.9` < `1.10`). Der Hinweis erscheint nur, wenn die Version auf GitHub
+  **neuer** ist.
+- Ist die lokale Version neuer (noch nicht hochgeladen, oder GitHub liefert
+  die neue Datei erst nach einigen Minuten aus), gibt es nur eine kurze
+  Info-Zeile im Lauf, keinen Hinweis in der Zusammenfassung.
+- Der Cache merkt sich zusätzlich die lokale Version des letzten Checks.
+  Wurde das Script seitdem aktualisiert, wird sofort neu geprüft. Ältere
+  Cache-Dateien werden dabei automatisch erneuert.
 
 ---
 
@@ -1193,6 +1226,11 @@ automatisierten Läufen nicht unbegrenzt wächst.
 ---
 
 ## Troubleshooting
+
+**„Für install-oxicloud.sh liegt auf GitHub eine andere Version vor", obwohl die neue Version schon hochgeladen ist:**
+Betrifft Versionen bis 1.22 (Cache des Update-Checks, siehe „Fix in 1.23").
+Ab 1.23 behoben. Wer noch eine ältere Version nutzt, kann den Cache von
+Hand löschen: `rm /etc/oxicloud/.update-check-install-oxicloud`.
 
 **„Umbau der .env auf 'de' abgebrochen – diese Einstellungen wären verändert worden" (neu in 1.22):**
 Die Sicherheitsprüfung hat angeschlagen; die `.env` ist unverändert, das
