@@ -3,12 +3,20 @@
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.25
+# Version:          1.26
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-10-08 UTC (stiller Abbruch nach dem Preflight behoben)
+# Zuletzt geändert: 2026-10-08 UTC (.env-Status und Übersetzungshinweis in der Zusammenfassung)
 #
 # Changelog:
+#   1.26 - Zusammenfassung zeigt jetzt den Stand der .env: "keine Änderungen
+#          erforderlich", "N neue Variable(n) ergänzt (davon M noch nicht
+#          übersetzt)", "neu angelegt" oder "umgebaut", dazu die verwaltete
+#          Sprache. Hat sich die example.env im Repository seit dem letzten
+#          Lauf geändert (Prüfsumme in /etc/oxicloud/.env-template.sha256)
+#          oder kennt die Übersetzung (ENV_LANGUAGE) Variablen noch nicht,
+#          erscheint am Ende ein Hinweis mit den Namen und der Empfehlung,
+#          die neue Fassung übersetzen zu lassen.
 #   1.25 - BUGFIX stiller Abbruch: Das Script endete direkt nach "Basis-
 #          Abhängigkeiten sind vorhanden" ohne jede Meldung. Ursache war die
 #          Selbstprüfung auf eine neuere Script-Version: Die von GitHub
@@ -298,7 +306,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben)
-SCRIPT_VERSION="1.25"
+SCRIPT_VERSION="1.26"
 
 # Simulationsmodus: true = keine echten Änderungen am System, nur Logging.
 # Nützlich um z.B. eine geänderte Konfiguration (ENV_OVERRIDE_*, Pins, ...)
@@ -1261,6 +1269,7 @@ env_append_missing() {
     rm -f "${tmpenv}"
   fi
   local total=$(( na + nc + na2 + nc2 ))
+  ENV_ADDED_TOTAL=${total}; ENV_ADDED_UNTRANSLATED=$(( na2 + nc2 ))
   if [[ ${total} -eq 0 ]]; then
     echo "    .env ist vollständig: alle Variablen der Vorlage sind vorhanden (aktiv oder auskommentiert)."
   elif [[ "${DRY_RUN}" == "true" ]]; then
@@ -1303,6 +1312,7 @@ env_convert_language() {
     echo "    WARNUNG: Umbau der .env auf '${ENV_LANGUAGE}' abgebrochen - diese Einstellungen wären verändert worden:"
     printf '%s\n' "${lost}" | sed 's/=.*/=…/; s/^/      /'
     echo "    Die .env bleibt unverändert; es werden nur fehlende Variablen ergänzt."
+    ENV_CONVERT_FAILED=1
     rm -f "${keys}" "${new}" "${before}" "${after}"
     return 1
   fi
@@ -1314,6 +1324,7 @@ env_convert_language() {
     backup_file "${env}"
     cat "${new}" > "${env}"
     echo "    .env auf Vorlage $(basename "${lang_tpl}") umgebaut; alle bisherigen Werte sind erhalten (geprüft)."
+    ENV_CONVERTED=1
     [[ -n "${gained// /}" ]] && echo "    Neu wirksam (Standardwerte der Vorlage, wie bei einer Neuinstallation): ${gained}"
     echo "    Die vorherige Fassung liegt unter ${CONFIG_DIR}/backups/."
   fi
@@ -1322,12 +1333,28 @@ env_convert_language() {
 }
 
 env_texts
+ENV_ADDED_TOTAL=0; ENV_ADDED_UNTRANSLATED=0; ENV_CONVERTED=0; ENV_CONVERT_FAILED=0; ENV_CREATED=0
+ENV_TEMPLATE_CHANGED=0; ENV_UNTRANSLATED_KEYS=""
 ENV_TEMPLATE="$(find_env_template || true)"
+
+# Neu in 1.26: Merken, ob sich die Vorlage im Repository seit dem letzten Lauf
+# geändert hat (Prüfsumme in CONFIG_DIR), für den Hinweis in der Zusammenfassung.
+ENV_TEMPLATE_SUM_FILE="${CONFIG_DIR}/.env-template.sha256"
+if [[ -n "${ENV_TEMPLATE}" ]]; then
+  ENV_TEMPLATE_SUM="$(sha256sum "${ENV_TEMPLATE}" | cut -d' ' -f1)"
+  if [[ -f "${ENV_TEMPLATE_SUM_FILE}" && "$(cat "${ENV_TEMPLATE_SUM_FILE}" 2>/dev/null)" != "${ENV_TEMPLATE_SUM}" ]]; then
+    ENV_TEMPLATE_CHANGED=1
+  fi
+  [[ "${DRY_RUN}" == "true" ]] || printf '%s\n' "${ENV_TEMPLATE_SUM}" > "${ENV_TEMPLATE_SUM_FILE}" 2>/dev/null || true
+fi
 ENV_LANG_TEMPLATE=""
 if [[ -n "${ENV_LANGUAGE}" && -n "${ENV_TEMPLATE}" ]]; then
   ENV_LANG_TEMPLATE="$(env_lang_template "${ENV_LANGUAGE}" "${ENV_TEMPLATE}")"
   if [[ -z "${ENV_LANG_TEMPLATE}" ]]; then
     echo "    WARNUNG: ENV_LANGUAGE=${ENV_LANGUAGE}, aber ${ENV_TEMPLATE_DIR}/example.env.${ENV_LANGUAGE} fehlt - verwende die Vorlage aus dem Repository."
+  elif [[ "${ENV_LANG_TEMPLATE}" != "${ENV_TEMPLATE}" ]]; then
+    # Variablen des Repositorys, die die Übersetzung (noch) nicht kennt
+    ENV_UNTRANSLATED_KEYS="$(comm -23 <(env_keys "${ENV_TEMPLATE}") <(env_keys "${ENV_LANG_TEMPLATE}") | tr '\n' ' ')"
   fi
 fi
 
@@ -1343,9 +1370,11 @@ if [[ ! -f "${CONFIG_DIR}/.env" ]]; then
     env_convert_language "${ENV_LANG_TEMPLATE}" "${ENV_TEMPLATE}" >/dev/null || true
     [[ "${ENV_LANG_TEMPLATE}" != "${ENV_TEMPLATE}" ]] && env_append_missing "${ENV_LANG_TEMPLATE}" "${ENV_TEMPLATE}" >/dev/null
     echo "    .env aus $(basename "${ENV_LANG_TEMPLATE}") angelegt (Sprache: ${ENV_LANGUAGE})."
+    ENV_CREATED=1
   else
     cp "${ENV_TEMPLATE}" "${CONFIG_DIR}/.env"
     echo "    .env aus $(basename "${ENV_TEMPLATE}") angelegt."
+    ENV_CREATED=1
   fi
 elif [[ -z "${ENV_TEMPLATE}" ]]; then
   echo "    Hinweis: Keine Vorlage (example.env, .env.example, env.example) gefunden - Abgleich übersprungen."
@@ -1755,6 +1784,24 @@ echo ""
 echo " URL:               http://$(hostname -I | awk '{print $1}'):${OXICLOUD_PORT}"
 echo " Installationspfad: ${OXICLOUD_HOME}"
 echo " Konfiguration:     /etc/oxicloud/.env"
+if [[ "${ENV_CREATED}" -eq 1 ]]; then
+  ENV_STATE="neu angelegt"
+elif [[ "${ENV_CONVERTED}" -eq 1 ]]; then
+  ENV_STATE="auf Sprache '${ENV_LANGUAGE}' umgebaut (alle Werte erhalten, geprüft)"
+  [[ "${ENV_ADDED_TOTAL}" -gt 0 ]] && ENV_STATE="${ENV_STATE}, ${ENV_ADDED_TOTAL} Variable(n) ergänzt"
+elif [[ "${ENV_ADDED_TOTAL}" -gt 0 ]]; then
+  ENV_STATE="${ENV_ADDED_TOTAL} neue Variable(n) ergänzt"
+  if [[ "${ENV_ADDED_UNTRANSLATED}" -gt 0 ]]; then
+    ENV_STATE="${ENV_STATE}, davon ${ENV_ADDED_UNTRANSLATED} noch nicht übersetzt"
+  fi
+elif [[ -z "${ENV_TEMPLATE}" ]]; then
+  ENV_STATE="nicht abgeglichen (keine Vorlage gefunden)"
+else
+  ENV_STATE="keine Änderungen erforderlich (vollständig)"
+fi
+[[ "${DRY_RUN}" == "true" ]] && ENV_STATE="${ENV_STATE} [DRY_RUN]"
+echo " .env-Abgleich:     ${ENV_STATE}"
+echo " .env-Sprache:      $( [[ -n "${ENV_LANG_TEMPLATE}" ]] && echo "${ENV_LANGUAGE} (Vorlage $(basename "${ENV_LANG_TEMPLATE}"))" || echo "nicht verwaltet (ENV_LANGUAGE leer)" )"
 echo " Aktives Release:   $(readlink -f "${CURRENT_LINK}" 2>/dev/null || echo "unbekannt")"
 echo " Zuletzt gesundes Release (current-good): $(readlink -f "${CURRENT_GOOD_LINK}" 2>/dev/null || echo "noch keins")"
 echo " OxiCloud-Version:  $( [[ -z "${OXICLOUD_VERSION_PIN}" ]] && echo "main-Branch (${NEW_REV:0:8})" || echo "${TARGET_REF} (${NEW_REV:0:8})" )"
@@ -1781,6 +1828,34 @@ echo "======================================================================"
 # ein Grund bestünde, extra ins Install-Log zu schauen. Erscheint hier
 # erneut, falls beim Update-Check (oben, ggf. aus dem Cache übernommen)
 # eine abweichende Version gefunden wurde.
+if [[ "${ENV_CONVERT_FAILED}" -eq 1 ]]; then
+  echo ""
+  echo "Hinweis: Der Umbau der .env auf '${ENV_LANGUAGE}' wurde abgebrochen (Werte wären verändert"
+  echo "         worden). Details weiter oben im Lauf bzw. im Log."
+fi
+if [[ -n "${ENV_LANG_TEMPLATE}" && "${ENV_LANG_TEMPLATE}" != "${ENV_TEMPLATE}" ]]; then
+  ENV_UNTRANSLATED_COUNT="$(wc -w <<< "${ENV_UNTRANSLATED_KEYS}")"
+  if [[ "${ENV_UNTRANSLATED_COUNT}" -gt 0 || "${ENV_TEMPLATE_CHANGED}" -eq 1 ]]; then
+    echo ""
+    if [[ "${ENV_TEMPLATE_CHANGED}" -eq 1 ]]; then
+      echo "Hinweis: $(basename "${ENV_TEMPLATE}") im OxiCloud-Repository hat sich seit dem letzten Lauf geändert."
+    else
+      echo "Hinweis: Die Übersetzung $(basename "${ENV_LANG_TEMPLATE}") ist nicht auf dem Stand des Repositorys."
+    fi
+    if [[ "${ENV_UNTRANSLATED_COUNT}" -gt 0 ]]; then
+      echo "         ${ENV_UNTRANSLATED_COUNT} Variable(n) sind in $(basename "${ENV_LANG_TEMPLATE}") noch nicht übersetzt:"
+      printf '%s\n' ${ENV_UNTRANSLATED_KEYS} | head -n 10 | sed 's/^/           /'
+      [[ "${ENV_UNTRANSLATED_COUNT}" -gt 10 ]] && echo "           … und $(( ENV_UNTRANSLATED_COUNT - 10 )) weitere"
+    else
+      echo "         Alle Variablen sind übersetzt, aber Erklärungstexte können sich geändert haben."
+    fi
+    echo "         Empfehlung: die aktuelle Vorlage übersetzen lassen"
+    echo "           ${ENV_TEMPLATE}"
+    echo "         und die Übersetzung ablegen als"
+    echo "           ${ENV_LANG_TEMPLATE}"
+    echo "         Bis dahin werden neue Variablen mit englischem Text ergänzt."
+  fi
+fi
 if [[ -n "${UPDATE_AVAILABLE_VERSION}" ]]; then
   echo ""
   echo "Hinweis: Für install-oxicloud.sh liegt auf GitHub eine neuere Version vor"
