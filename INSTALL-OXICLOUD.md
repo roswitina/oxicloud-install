@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.23
+Version: 1.25
 Lizenz: MIT
 
 ---
@@ -29,7 +29,9 @@ Lizenz: MIT
 | 1.20 | Neuer, standardmäßig deaktivierter Schalter `AUTO_REPAIR_MODIFIED_MIGRATIONS` für den Fall „migration X was previously applied but has been modified" (sqlx-Checksummen-Mismatch bei ungepinntem main-Branch), siehe Abschnitt „Neuerung in 1.20" unten |
 | 1.21 | Bugfix `.env`-Abgleich: Auch auskommentierte, optionale Variablen der Vorlage werden jetzt samt Erklärungstext in eine bestehende `.env` übernommen; Vorlage wird unter `example.env`, `.env.example` und `env.example` gesucht, siehe Abschnitt „Neuerung in 1.21" unten |
 | 1.22 | Neue Einstellung `ENV_LANGUAGE`: `.env` auf Deutsch (oder Englisch) anlegen bzw. einmalig umbauen – mit Prüfung, dass alle eigenen Werte erhalten bleiben; danach werden neue Variablen in der gewählten Sprache ergänzt, siehe Abschnitt „Neuerung in 1.22" unten |
-| **1.23** | **Bugfix Update-Hinweis:** erscheint nur noch, wenn auf GitHub eine **neuere** Version liegt; nach einem lokalen Script-Update wird sofort neu geprüft statt einen veralteten Stand aus dem Cache zu zeigen, siehe Abschnitt „Fix in 1.23" unten |
+| 1.23 | Bugfix Update-Hinweis: erscheint nur noch, wenn auf GitHub eine **neuere** Version liegt; nach einem lokalen Script-Update wird sofort neu geprüft statt einen veralteten Stand aus dem Cache zu zeigen, siehe Abschnitt „Fix in 1.23" unten |
+| 1.24 | Ruhigere Läufe ohne Änderungen: virtuelle Pakete (z. B. `postgresql-contrib` unter Debian 13) gelten als vorhanden, kein unnötiges `apt-get` mehr bei jedem Lauf; ausführlicher Ressourcen-Hinweis nur noch, wenn tatsächlich gebaut wird, siehe Abschnitt „Fix in 1.24" unten |
+| **1.25** | **Bugfix stiller Abbruch** direkt nach dem Preflight-Check (Selbstprüfung auf neuere Script-Version, SIGPIPE bei Scripts über 64 KB); unerwartete Abbrüche werden jetzt mit Zeilennummer gemeldet, siehe Abschnitt „Fix in 1.25" unten |
 
 ---
 
@@ -46,6 +48,81 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Fix in 1.25
+
+### Script endete still nach „Basis-Abhängigkeiten sind vorhanden“
+
+**Symptom:** Der Lauf hörte direkt nach dieser Zeile auf – ohne Fehlermeldung,
+ohne Zusammenfassung, OxiCloud wurde weder geprüft noch aktualisiert.
+
+```
+==> Verifiziere, dass die Basis-Programme tatsächlich verfügbar sind...
+    Basis-Abhängigkeiten sind vorhanden (Node/npm/cargo werden weiter unten installiert/geprüft).
+root@DietPi:/opt#
+```
+
+**Ursache:** Die Selbstprüfung auf eine neuere Script-Version lädt die
+Fassung von GitHub und suchte darin mit `printf … | grep -m1` nach der
+Versionszeile. `grep -m1` beendet sich nach dem ersten Treffer; ist der
+Text größer als der Pipe-Puffer (64 KB), bekommt `printf` ein `SIGPIPE`.
+Mit `set -o pipefail` gilt das als Fehler, und `set -e` beendet das Script –
+kommentarlos mit Exit-Code 141. Aufgetreten ist das, seit das Script selbst
+größer als 64 KB ist (ab 1.21/1.22 auf GitHub).
+
+**Behoben:** Die Versionszeile wird jetzt per Here-String gesucht (keine
+Pipe, kein `SIGPIPE`). Dieselbe Falle steckte in der Auswertung einer
+fehlgeschlagenen Migration (ohne Treffer endete das Script still, statt die
+eigentliche Fehlermeldung zu zeigen) – ebenfalls behoben.
+
+**Neu:** Bricht das Script künftig unerwartet ab, steht am Ende eine
+Meldung mit Zeilennummer und Befehl, z. B.
+
+```
+==> ABBRUCH: unerwarteter Fehler in Zeile 712 (Exit-Code 1).
+    Befehl: …
+```
+
+statt dass es einfach still endet.
+
+---
+
+## Fix in 1.24
+
+### Ruhigere Läufe, wenn nichts ansteht
+
+**1. Paketprüfung erkennt virtuelle Pakete.** Bisher meldete das Script bei
+jedem Lauf
+
+```
+Fehlende Pakete werden installiert: postgresql-contrib
+```
+
+und führte `apt-get update` und `apt-get install` aus – ohne dass danach
+etwas installiert wurde. Grund: Unter Debian 13 ist `postgresql-contrib` ein
+*virtuelles* Paket, das vom Paket `postgresql` bereitgestellt wird
+(„Provides“). `dpkg -s postgresql-contrib` findet dafür keinen Eintrag, apt
+selbst weiß aber, dass `postgresql` den Bedarf deckt („postgresql is
+already the newest version“). Jetzt gilt ein Paket auch dann als vorhanden,
+wenn ein installiertes Paket es bereitstellt. Nachprüfen lässt sich das mit
+`dpkg-query -W -f='${Provides}\n' postgresql`.
+
+**2. Ressourcen-Hinweis nur noch beim Bauen.** Der große Kasten
+„Ressourcenbedarf zum Kompilieren“ samt ACHTUNG-Warnung erschien bisher bei
+jedem Lauf, auch wenn gar nichts gebaut wurde. Jetzt steht am Anfang nur
+noch eine Zeile, z. B.
+
+```
+==> Ressourcen: 2 CPU-Kern(e), ca. 3 GB RAM, ca. 22 GB frei unter /opt (für einen Neubau knapp - Hinweis folgt nur, falls gebaut wird)
+```
+
+Der ausführliche Hinweis kommt erst, wenn ein Neubau tatsächlich ansteht
+(neuer Commit, neue Rust-Version, geänderte Build-Features) – direkt vor
+dem Anlegen des Swapfiles und dem Build. Der harte Abbruch bei kritisch
+wenig Speicherplatz (`DISK_ABORT_THRESHOLD_GB`) greift unverändert schon am
+Anfang.
 
 ---
 
@@ -1226,6 +1303,11 @@ automatisierten Läufen nicht unbegrenzt wächst.
 ---
 
 ## Troubleshooting
+
+**Script endet ohne Meldung direkt nach „Basis-Abhängigkeiten sind vorhanden“:**
+Betrifft 1.23 und 1.24 (siehe „Fix in 1.25“). Auf 1.25 aktualisieren. Als
+Notlösung mit älteren Versionen: im Konfigurationsblock
+`CHECK_FOR_UPDATES=false` setzen.
 
 **„Für install-oxicloud.sh liegt auf GitHub eine andere Version vor", obwohl die neue Version schon hochgeladen ist:**
 Betrifft Versionen bis 1.22 (Cache des Update-Checks, siehe „Fix in 1.23").
