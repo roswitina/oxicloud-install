@@ -1,14 +1,25 @@
+
 #!/usr/bin/env bash
 #
 # Native (non-container) install script for OxiCloud
 # https://github.com/AtalayaLabs/OxiCloud
 #
-# Version:          1.22
+# Version:          1.23
 # Lizenz:           MIT
 # Erstellt am:      2026-07-13 15:59 UTC
-# Zuletzt geändert: 2026-10-08 UTC (Sprachwahl für die .env: ENV_LANGUAGE)
+# Zuletzt geändert: 2026-10-08 UTC (Update-Hinweis nur noch bei neuerer Version)
 #
 # Changelog:
+#   1.23 - BUGFIX Update-Hinweis: Er erschien auch, wenn auf GitHub eine
+#          ÄLTERE Version lag, und zeigte nach einem lokalen Script-Update
+#          bis zu UPDATE_CHECK_INTERVAL_HOURS lang einen veralteten Stand aus
+#          dem Cache (z. B. "lokal 1.22, dort 1.20", obwohl auf GitHub schon
+#          1.22 lag). Jetzt werden Versionen der Größe nach verglichen
+#          (sort -V); ein Hinweis kommt nur bei einer NEUEREN Version auf
+#          GitHub. Ist lokal neuer, gibt es nur eine kurze Info-Zeile. Der
+#          Cache speichert zusätzlich die lokale Version; nach einem
+#          Script-Update wird sofort neu geprüft. Alte Cache-Dateien werden
+#          dadurch automatisch erneuert.
 #   1.22 - Neue Einstellung ENV_LANGUAGE ("" | "de" | "en") für die Sprache
 #          der Erklärungstexte in /etc/oxicloud/.env. Bei "de" dient
 #          ENV_TEMPLATE_DIR/example.env.de als Vorlage. Eine bestehende .env
@@ -268,7 +279,7 @@ DB_USER="oxicloud"
 REPO_URL="https://github.com/AtalayaLabs/OxiCloud.git"
 
 # Script-Version (siehe Header-Kommentar oben)
-SCRIPT_VERSION="1.22"
+SCRIPT_VERSION="1.23"
 
 # Simulationsmodus: true = keine echten Änderungen am System, nur Logging.
 # Nützlich um z.B. eine geänderte Konfiguration (ENV_OVERRIDE_*, Pins, ...)
@@ -626,41 +637,52 @@ echo "    Basis-Abhängigkeiten sind vorhanden (Node/npm/cargo werden weiter unt
 # wegen UPDATE_CHECK_INTERVAL_HOURS übersprungen wurde, der letzte
 # tatsächliche Check (an einem Vortag) aber schon eine neuere Version fand.
 UPDATE_AVAILABLE_VERSION=""
+# Fix (1.23): Versionen werden jetzt der Größe nach verglichen (sort -V) -
+# ein Hinweis kommt nur noch, wenn die Version auf GitHub NEUER ist als die
+# lokale. Der Cache merkt sich zusätzlich (Zeile 3) die lokale Version beim
+# letzten Check; wurde das Script seither aktualisiert, wird sofort neu
+# geprüft statt bis zu UPDATE_CHECK_INTERVAL_HOURS einen veralteten Stand
+# anzuzeigen.
+version_gt() {  # wahr, wenn $1 > $2
+  [[ -n "$1" && -n "$2" && "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+}
 if [[ "${CHECK_FOR_UPDATES}" == "true" ]] && command -v curl &>/dev/null; then
   DO_UPDATE_CHECK=1
   CACHED_REMOTE_VERSION=""
   if [[ -f "${UPDATE_CHECK_CACHE}" ]]; then
     LAST_CHECK_EPOCH="$(sed -n '1p' "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo 0)"
     CACHED_REMOTE_VERSION="$(sed -n '2p' "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo "")"
+    CACHED_LOCAL_VERSION="$(sed -n '3p' "${UPDATE_CHECK_CACHE}" 2>/dev/null || echo "")"
+    [[ "${LAST_CHECK_EPOCH}" =~ ^[0-9]+$ ]] || LAST_CHECK_EPOCH=0
     NOW_EPOCH="$(date +%s)"
     AGE_HOURS=$(( (NOW_EPOCH - LAST_CHECK_EPOCH) / 3600 ))
-    [[ "${AGE_HOURS}" -lt "${UPDATE_CHECK_INTERVAL_HOURS}" ]] && DO_UPDATE_CHECK=0
+    [[ "${AGE_HOURS}" -lt "${UPDATE_CHECK_INTERVAL_HOURS}" && "${CACHED_LOCAL_VERSION}" == "${SCRIPT_VERSION}" ]] && DO_UPDATE_CHECK=0
   fi
 
   if [[ "${DO_UPDATE_CHECK}" -eq 1 ]]; then
+    REMOTE_SCRIPT_VERSION=""
     REMOTE_RAW_SCRIPT="$(github_curl -fsS -m 5 \
       "https://raw.githubusercontent.com/${UPDATE_CHECK_REPO}/${UPDATE_CHECK_BRANCH}/install-oxicloud.sh" 2>/dev/null)" || true
     if [[ -n "${REMOTE_RAW_SCRIPT}" ]]; then
       REMOTE_SCRIPT_VERSION="$(printf '%s\n' "${REMOTE_RAW_SCRIPT}" | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
-      if [[ -n "${REMOTE_SCRIPT_VERSION}" && "${REMOTE_SCRIPT_VERSION}" != "${SCRIPT_VERSION}" ]]; then
+      if version_gt "${REMOTE_SCRIPT_VERSION}" "${SCRIPT_VERSION}"; then
         UPDATE_AVAILABLE_VERSION="${REMOTE_SCRIPT_VERSION}"
         echo ""
-        echo "Hinweis: Auf GitHub liegt eine andere Version von install-oxicloud.sh"
+        echo "Hinweis: Auf GitHub liegt eine neuere Version von install-oxicloud.sh"
         echo "         (lokal: ${SCRIPT_VERSION}, dort auf '${UPDATE_CHECK_BRANCH}': ${REMOTE_SCRIPT_VERSION})."
         echo "         https://github.com/${UPDATE_CHECK_REPO}"
         echo "         (Dieser Hinweis erscheint am Ende auch nochmal in der Zusammenfassung.)"
         echo ""
+      elif version_gt "${SCRIPT_VERSION}" "${REMOTE_SCRIPT_VERSION}"; then
+        echo "    Info: Lokale Script-Version ${SCRIPT_VERSION} ist neuer als die auf GitHub (${REMOTE_SCRIPT_VERSION})."
+        echo "    (Noch nicht hochgeladen? GitHub liefert neue Dateien manchmal erst nach einigen Minuten aus.)"
       fi
     fi
     mkdir -p "$(dirname "${UPDATE_CHECK_CACHE}")" 2>/dev/null || true
-    { date +%s; echo "${UPDATE_AVAILABLE_VERSION}"; } > "${UPDATE_CHECK_CACHE}" 2>/dev/null || true
-  elif [[ -n "${CACHED_REMOTE_VERSION}" && "${CACHED_REMOTE_VERSION}" != "${SCRIPT_VERSION}" ]]; then
-    # Check heute schon gelaufen (Cache greift), letzter tatsächlicher Check
-    # hatte aber eine neuere Version gefunden - Hinweis bleibt sichtbar,
-    # bis entweder das Script aktualisiert wird oder ein neuer echter Check
-    # dieselbe Version bestätigt (dann wird der Cache-Eintrag oben beim
-    # nächsten echten Check ohnehin durch die aktuelle Remote-Version
-    # überschrieben).
+    { date +%s; echo "${REMOTE_SCRIPT_VERSION}"; echo "${SCRIPT_VERSION}"; } > "${UPDATE_CHECK_CACHE}" 2>/dev/null || true
+  elif version_gt "${CACHED_REMOTE_VERSION}" "${SCRIPT_VERSION}"; then
+    # Check heute schon gelaufen (Cache greift), der letzte tatsächliche
+    # Check hatte aber eine neuere Version gefunden - Hinweis bleibt sichtbar.
     UPDATE_AVAILABLE_VERSION="${CACHED_REMOTE_VERSION}"
   fi
 fi
@@ -1694,7 +1716,7 @@ echo "======================================================================"
 # eine abweichende Version gefunden wurde.
 if [[ -n "${UPDATE_AVAILABLE_VERSION}" ]]; then
   echo ""
-  echo "Hinweis: Für install-oxicloud.sh liegt auf GitHub eine andere Version vor"
+  echo "Hinweis: Für install-oxicloud.sh liegt auf GitHub eine neuere Version vor"
   echo "         (lokal: ${SCRIPT_VERSION}, dort auf '${UPDATE_CHECK_BRANCH}': ${UPDATE_AVAILABLE_VERSION})."
   echo "         https://github.com/${UPDATE_CHECK_REPO}"
 fi
