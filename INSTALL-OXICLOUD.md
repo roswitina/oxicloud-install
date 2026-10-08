@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.21
+Version: 1.22
 Lizenz: MIT
 
 ---
@@ -27,7 +27,8 @@ Lizenz: MIT
 | 1.18 | Review-Runde mit 13 Fixes/Verbesserungen, siehe Abschnitt „Neuerungen in 1.18" unten: u. a. abgesicherte `latest`-Release-Ermittlung, vorgezogene Dependency-Verifizierung, optionales `GITHUB_TOKEN`, bedarfsgesteuerter + garantiert aufgeräumter Swapfile, neuer `current-good`-Rollback-Anker, tolerantere Health-Check-Codes, korrigierte ufw-Prüfung, Backup vor destruktivem Directory-Cleanup, sed-Escaping in `set_env_var()`, restriktivere Rechte auf `/etc/oxicloud`, robuste Diskspace-Ermittlung und neuer `DRY_RUN`-Modus |
 | 1.19 | Der Hinweis auf eine neuere Script-Version erscheint zusätzlich im finalen Zusammenfassungsblock statt nur mitten im scrollenden Lauf-Output, siehe Abschnitt „Neuerung in 1.19" unten — bleibt dafür seit dieser Version auch über den Update-Check-Cache hinweg sichtbar |
 | 1.20 | Neuer, standardmäßig deaktivierter Schalter `AUTO_REPAIR_MODIFIED_MIGRATIONS` für den Fall „migration X was previously applied but has been modified" (sqlx-Checksummen-Mismatch bei ungepinntem main-Branch), siehe Abschnitt „Neuerung in 1.20" unten |
-| **1.21** | **Bugfix `.env`-Abgleich:** Auch auskommentierte, optionale Variablen der Vorlage werden jetzt samt Erklärungstext in eine bestehende `.env` übernommen; Vorlage wird unter `example.env`, `.env.example` und `env.example` gesucht, siehe Abschnitt „Neuerung in 1.21" unten |
+| 1.21 | Bugfix `.env`-Abgleich: Auch auskommentierte, optionale Variablen der Vorlage werden jetzt samt Erklärungstext in eine bestehende `.env` übernommen; Vorlage wird unter `example.env`, `.env.example` und `env.example` gesucht, siehe Abschnitt „Neuerung in 1.21" unten |
+| **1.22** | **Neue Einstellung `ENV_LANGUAGE`:** `.env` auf Deutsch (oder Englisch) anlegen bzw. einmalig umbauen – mit Prüfung, dass alle eigenen Werte erhalten bleiben; danach werden neue Variablen in der gewählten Sprache ergänzt, siehe Abschnitt „Neuerung in 1.22" unten |
 
 ---
 
@@ -44,6 +45,84 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerung in 1.22
+
+### Sprache der `.env` wählen: `ENV_LANGUAGE`
+
+Die Erklärungstexte in `/etc/oxicloud/.env` stammen aus der Vorlage
+`example.env` des Repositorys und sind englisch. Mit der neuen Einstellung
+`ENV_LANGUAGE` im Konfigurationsblock lässt sich die Sprache wählen:
+
+| Wert | Wirkung |
+|---|---|
+| `""` (Standard) | wie in 1.21: `.env` wird nicht umgebaut, fehlende Variablen kommen mit englischem Text dazu |
+| `"de"` | deutsche `.env` – Vorlage ist `ENV_TEMPLATE_DIR/example.env.de` |
+| `"en"` | englische `.env` im Aufbau der `example.env` des Repositorys |
+
+**Einrichten (Deutsch):**
+
+1. Die deutsche Vorlage `example.env.de` nach `/etc/oxicloud/example.env.de`
+   kopieren (Standard für `ENV_TEMPLATE_DIR` ist `/etc/oxicloud`). Dort
+   überschreibt sie kein Update – anders als die `example.env` im
+   Programmordner `/opt/oxicloud`, die bei jedem `git reset` erneuert wird.
+2. Im Konfigurationsblock `ENV_LANGUAGE="de"` setzen.
+3. Script wie gewohnt ausführen (vorher Snapshot).
+
+**Was beim ersten Lauf passiert – einmaliger Umbau:**
+
+- Die bestehende `.env` wird im Aufbau der deutschen Vorlage neu
+  geschrieben: deutsche Abschnitte, deutsche Erklärungen, dieselbe
+  Reihenfolge wie die Vorlage.
+- **Eigene Werte bleiben erhalten:** Für jede Variable wird die eigene
+  Zeile aus der bisherigen `.env` an ihre Stelle in der Vorlage gesetzt –
+  aktiv, wenn sie aktiv war, auskommentiert, wenn sie auskommentiert war.
+  Kommt eine Variable in der Vorlage mehrfach vor (Beispielzeilen), wird
+  nur die erste ersetzt; weitere werden nie zusätzlich aktiv.
+- Variablen der bisherigen `.env`, die die Vorlage nicht kennt (eigene
+  Variablen, ältere Namen), kommen gesammelt ans Ende unter
+  „Weitere Einstellungen aus der bisherigen .env".
+- Blöcke der Vorlage, deren Variable es im Repository nicht mehr gibt und
+  die in der `.env` nicht vorkommt, entfallen.
+- **Prüfung:** Vor dem Schreiben vergleicht das Script die wirksamen
+  Einstellungen (so, wie systemd die `.env` liest: letzte aktive Zeile je
+  Variable gewinnt) vorher und nachher. Würde sich auch nur ein bisher
+  wirksamer Wert ändern, bricht der Umbau ab, nennt die betroffene
+  Variable (ohne Wert) und die `.env` bleibt unverändert. Neu wirksam
+  werden dürfen nur Standardwerte der Vorlage für Variablen, die vorher gar
+  nicht gesetzt waren – genau wie bei einer Neuinstallation; das Script
+  nennt sie.
+- Vorher wird wie immer eine Zeitstempel-Kopie unter
+  `/etc/oxicloud/backups/` angelegt.
+- Eine Markierungszeile ganz oben merkt sich die Sprache:
+  `# install-oxicloud.sh: env-language=de`
+
+**Bei jedem weiteren Lauf** wird nicht mehr umgebaut, sondern nur ergänzt:
+Bringt eine neue OxiCloud-Version neue Variablen mit, kommen sie mit dem
+deutschen Text aus `example.env.de` dazu. Gibt es für eine Variable noch
+keine Übersetzung, kommt sie mit dem englischen Text aus dem Repository
+dazu, markiert mit
+`# [noch nicht übersetzt - Text aus der englischen Vorlage des Repositorys]`.
+Maßgeblich dafür, welche Variablen es gibt, ist immer die `example.env` des
+Repositorys.
+
+**Sprache wechseln:** `ENV_LANGUAGE` ändern und das Script ausführen. Weil
+die Markierung nicht mehr passt, wird die `.env` erneut umgebaut – mit
+derselben Prüfung. `ENV_LANGUAGE=""` lässt eine bereits umgebaute `.env`
+einfach so, wie sie ist.
+
+**Neuinstallation:** Mit `ENV_LANGUAGE="de"` wird die `.env` direkt aus der
+deutschen Vorlage angelegt (plus noch nicht übersetzte Variablen).
+
+**Zu beachten:** Eigene Kommentarzeilen, die man selbst in die `.env`
+geschrieben hat, übernimmt der Umbau nicht – nur die Variablenzeilen. Die
+alte Fassung liegt im Backup-Ordner.
+
+Nebenbei behoben: Bei einer **leeren** `.env` hat der Abgleich aus 1.21 die
+Vorlage nicht richtig erkannt (awk-Eigenheit bei leeren Dateien). Das ist
+jetzt korrigiert.
 
 ---
 
@@ -874,6 +953,8 @@ Schritte werden mit `[DRY_RUN]`-Präfix geloggt, aber nicht ausgeführt
 | `KEEP_RELEASES` | `5` | Wie viele alte versionierte Binaries behalten werden; `0` = nichts löschen. Das aktive Release **und** `current-good` bleiben davon immer ausgenommen |
 | `NODE_VERSION_PIN` | leer | Leer = immer neueste LTS-Major-Version; sonst z. B. `"22"` |
 | `RUST_VERSION_PIN` | leer | Leer = immer `rustup update stable`; sonst z. B. `"1.82.0"` |
+| `ENV_LANGUAGE` *(neu in 1.22)* | leer | Sprache der Erklärungstexte in der `.env`: `""` = wie bisher, `"de"` = Deutsch (Vorlage `ENV_TEMPLATE_DIR/example.env.de`), `"en"` = Englisch. Baut eine bestehende `.env` einmalig geprüft um, siehe „Neuerung in 1.22" |
+| `ENV_TEMPLATE_DIR` *(neu in 1.22)* | `/etc/oxicloud` | Ordner mit übersetzten Vorlagen `example.env.<sprache>` |
 | `ENV_OVERRIDE_SERVER_HOST` | leer | Überschreibt `OXICLOUD_SERVER_HOST` in der `.env`, z. B. `"0.0.0.0"` — mit Firewall-Hinweis bei `0.0.0.0`/`::` (seit 1.18 nur bei aktivem ufw, siehe oben) |
 | `ENV_OVERRIDE_BASE_URL` | leer | Überschreibt `OXICLOUD_BASE_URL` in der `.env`, z. B. `"https://cloud.example.com"` — Sonderzeichen werden seit 1.18 korrekt escaped |
 | `OXICLOUD_VERSION_PIN` | leer | Leer = folgt `main`-Branch; `"latest"` = neuestes GitHub-Release (seit 1.18 robust gegen fehlschlagenden Abruf, siehe oben); `"vX.Y.Z"` = fester Tag. **Empfehlung:** für produktive Instanzen fest pinnen, damit der in 1.20 behandelte Fall (nachträglich geänderte, bereits angewendete Migration) gar nicht erst auftritt |
@@ -1112,6 +1193,17 @@ automatisierten Läufen nicht unbegrenzt wächst.
 ---
 
 ## Troubleshooting
+
+**„Umbau der .env auf 'de' abgebrochen – diese Einstellungen wären verändert worden" (neu in 1.22):**
+Die Sicherheitsprüfung hat angeschlagen; die `.env` ist unverändert, das
+Script läuft normal weiter. Die genannten Variablen in der `.env` ansehen
+(z. B. doppelt mit unterschiedlichen Werten oder ungewöhnlich
+geschrieben), bereinigen und das Script erneut ausführen.
+
+**„ENV_LANGUAGE=de, aber …/example.env.de fehlt" (neu in 1.22):**
+Die deutsche Vorlage liegt nicht unter `ENV_TEMPLATE_DIR`. Das Script
+arbeitet dann wie mit `ENV_LANGUAGE=""`. Datei nach
+`/etc/oxicloud/example.env.de` kopieren und erneut ausführen.
 
 **Nach dem Update auf 1.21 ist die `.env` viel länger (neu in 1.21):**
 Gewollt. Beim ersten Lauf werden einmalig alle Variablen der Vorlage
