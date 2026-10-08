@@ -6,7 +6,7 @@ betreibt — im Gegensatz zum separaten Prebuilt-Tooling
 (`build-package.sh`/`install.sh`/`update.sh`), das auf einer separaten
 Build-Maschine kompiliert und ein fertiges `.tar.gz` verteilt.
 
-Version: 1.25
+Version: 1.26
 Lizenz: MIT
 
 ---
@@ -31,7 +31,8 @@ Lizenz: MIT
 | 1.22 | Neue Einstellung `ENV_LANGUAGE`: `.env` auf Deutsch (oder Englisch) anlegen bzw. einmalig umbauen – mit Prüfung, dass alle eigenen Werte erhalten bleiben; danach werden neue Variablen in der gewählten Sprache ergänzt, siehe Abschnitt „Neuerung in 1.22" unten |
 | 1.23 | Bugfix Update-Hinweis: erscheint nur noch, wenn auf GitHub eine **neuere** Version liegt; nach einem lokalen Script-Update wird sofort neu geprüft statt einen veralteten Stand aus dem Cache zu zeigen, siehe Abschnitt „Fix in 1.23" unten |
 | 1.24 | Ruhigere Läufe ohne Änderungen: virtuelle Pakete (z. B. `postgresql-contrib` unter Debian 13) gelten als vorhanden, kein unnötiges `apt-get` mehr bei jedem Lauf; ausführlicher Ressourcen-Hinweis nur noch, wenn tatsächlich gebaut wird, siehe Abschnitt „Fix in 1.24" unten |
-| **1.25** | **Bugfix stiller Abbruch** direkt nach dem Preflight-Check (Selbstprüfung auf neuere Script-Version, SIGPIPE bei Scripts über 64 KB); unerwartete Abbrüche werden jetzt mit Zeilennummer gemeldet, siehe Abschnitt „Fix in 1.25" unten |
+| 1.25 | Bugfix stiller Abbruch direkt nach dem Preflight-Check (Selbstprüfung auf neuere Script-Version, SIGPIPE bei Scripts über 64 KB); unerwartete Abbrüche werden jetzt mit Zeilennummer gemeldet, siehe Abschnitt „Fix in 1.25" unten |
+| **1.26** | **Zusammenfassung zeigt den Stand der `.env`** („keine Änderungen erforderlich", „N neue Variable(n) ergänzt" …) und weist darauf hin, wenn sich die `example.env` geändert hat und die Übersetzung nachgezogen werden sollte, siehe Abschnitt „Neuerung in 1.26" unten |
 
 ---
 
@@ -48,6 +49,64 @@ neu.
 aus. Nicht beide gegen dasselbe `/opt/oxicloud` laufen lassen — entweder
 der Server baut sich selbst (dieses Script), oder er bekommt ein fertiges
 Paket von außen (Prebuilt-Tooling), nicht beides gemischt.
+
+---
+
+## Neuerung in 1.26
+
+### `.env`-Stand und Übersetzungshinweis in der Zusammenfassung
+
+Die Zusammenfassung am Ende enthält jetzt zwei zusätzliche Zeilen:
+
+```
+ .env-Abgleich:     keine Änderungen erforderlich (vollständig)
+ .env-Sprache:      de (Vorlage example.env.de)
+```
+
+Mögliche Werte für **`.env-Abgleich`**:
+
+| Anzeige | Bedeutung |
+|---|---|
+| `keine Änderungen erforderlich (vollständig)` | alle Variablen der Vorlage sind schon in der `.env` |
+| `N neue Variable(n) ergänzt` | neue Variablen wurden angehängt |
+| `…, davon M noch nicht übersetzt` | M davon kamen mit englischem Text, weil die Übersetzung sie noch nicht kennt |
+| `auf Sprache 'de' umgebaut (alle Werte erhalten, geprüft)` | einmaliger Umbau nach Setzen/Ändern von `ENV_LANGUAGE` |
+| `neu angelegt` | Erstinstallation |
+| `nicht abgeglichen (keine Vorlage gefunden)` | keine `example.env` im Repository |
+
+**`.env-Sprache`** zeigt die verwaltete Sprache und die verwendete Vorlage,
+oder „nicht verwaltet“, wenn `ENV_LANGUAGE` leer ist.
+
+**Hinweis bei geänderter Vorlage:** Das Script merkt sich eine Prüfsumme der
+`example.env` aus dem Repository (`/etc/oxicloud/.env-template.sha256`). Ist
+eine Sprache eingestellt und hat sich die Vorlage seit dem letzten Lauf
+geändert – oder kennt die Übersetzung Variablen des Repositorys noch nicht –,
+erscheint am Ende z. B.:
+
+```
+Hinweis: example.env im OxiCloud-Repository hat sich seit dem letzten Lauf geändert.
+         2 Variable(n) sind in example.env.de noch nicht übersetzt:
+           OXICLOUD_NEUE_OPTION
+           OXICLOUD_NOCH_EINE
+         Empfehlung: die aktuelle Vorlage übersetzen lassen
+           /opt/oxicloud/example.env
+         und die Übersetzung ablegen als
+           /etc/oxicloud/example.env.de
+         Bis dahin werden neue Variablen mit englischem Text ergänzt.
+```
+
+Ändern sich nur Erklärungstexte (keine neuen Variablen), heißt es „Alle
+Variablen sind übersetzt, aber Erklärungstexte können sich geändert haben“.
+Der Hinweis „hat sich geändert“ erscheint einmal pro Änderung; fehlen
+Übersetzungen, bleibt der Hinweis „nicht auf dem Stand des Repositorys“
+bei jedem Lauf sichtbar, bis die Übersetzung nachgezogen ist.
+
+Nach dem Ablegen einer neuen Übersetzung baut das Script die `.env` **nicht**
+erneut um – bereits ergänzte englische Blöcke bleiben stehen. Wer sie durch
+die deutschen ersetzen möchte: die englischen Blöcke unter
+„[noch nicht übersetzt …]“ aus der `.env` löschen (Werte vorher notieren,
+falls geändert) und das Script erneut ausführen; die Variablen werden dann
+mit deutschem Text ergänzt.
 
 ---
 
